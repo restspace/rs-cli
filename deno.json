@@ -1,0 +1,11 @@
+{
+  "name": "rs",
+  "version": "0.1.0",
+  "tasks": {
+    "dev": "deno run -A src/main.ts"
+  },
+  "imports": {
+    "cliffy/": "https://deno.land/x/cliffy@v1.0.0-rc.4/",
+    "std/path/": "https://deno.land/std@0.224.0/path/"
+  }
+}

@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(bd create \"Set up Deno project structure\" --description \"Set up the Deno repository with the project structure as defined in CLI_PLAN.md:\n- src/commands/ \\(config.ts, auth.ts, discover.ts, call.ts, pipeline.ts, query.ts, help.ts\\)\n- src/lib/ \\(api-client.ts, output.ts, config-store.ts\\)\n- src/concepts/ \\(services.json, pipelines.json, patterns.json, queries.json\\)\n- src/main.ts\n- deno.json\n- README.md\n\nUse Cliffy CLI framework. Set up basic project configuration.\")"
+    ]
+  }
+}
