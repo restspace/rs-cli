@@ -1,0 +1,22 @@
+{
+  "version": 1,
+  "siteRelativeUrl": "/files/transfer",
+  "files": {
+    "blender_webrtc_server.py.jpg": {
+      "localMtimeMs": 1748359123481,
+      "remoteMtimeMs": 1748359123481
+    },
+    "DemoBathroom_clay.glb": {
+      "localMtimeMs": 1748359835402,
+      "remoteMtimeMs": 1748359835402
+    },
+    "obs_bridge.py.jpg": {
+      "localMtimeMs": 1748353843267,
+      "remoteMtimeMs": 1748353843267
+    },
+    "ProductSnipper.zip.jpg": {
+      "localMtimeMs": 1758615945244,
+      "remoteMtimeMs": 1758615945244
+    }
+  }
+}

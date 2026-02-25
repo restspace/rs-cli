@@ -4,6 +4,7 @@ import { loadConfig, normalizeHost } from "../lib/config-store.ts";
 import { writeError, writeSuccess } from "../lib/output.ts";
 
 const SYNC_FILE_NAME = ".rs-sync";
+const SYNC_STATE_FILE_NAME = ".rs-sync-state.json";
 const CLOCK_SKEW_WINDOW_MS = 60_000;
 
 type SyncMode = "add" | "delete";
@@ -27,6 +28,27 @@ type SyncStats = {
   ignored: number;
   noChange: number;
   failed: number;
+};
+
+type LocalFileMeta = {
+  mtimeMs: number;
+};
+
+type RemoteFileMeta = {
+  mtimeMs: number;
+  etag?: string;
+};
+
+type SyncStateEntry = {
+  localMtimeMs: number;
+  remoteMtimeMs: number;
+  remoteEtag?: string;
+};
+
+type SyncStateFile = {
+  version: 1;
+  siteRelativeUrl: string;
+  files: Record<string, SyncStateEntry>;
 };
 
 type SyncPlanSummary = {
@@ -104,7 +126,8 @@ function isSyncMarker(relativePath: string): boolean {
     return false;
   }
   const parts = relativePath.split("/");
-  return parts[parts.length - 1] === SYNC_FILE_NAME;
+  const fileName = parts[parts.length - 1];
+  return fileName === SYNC_FILE_NAME || fileName === SYNC_STATE_FILE_NAME;
 }
 
 function siteFilePath(basePath: string, relativePath: string): string {
@@ -168,8 +191,8 @@ async function listRemoteFiles(
   host: string,
   token: string | undefined,
   basePath: string,
-): Promise<Map<string, number>> {
-  async function resolveRemoteMtimeMs(relativePath: string): Promise<number> {
+): Promise<Map<string, RemoteFileMeta>> {
+  async function fetchRemoteFileMeta(relativePath: string): Promise<RemoteFileMeta> {
     const filePath = siteFilePath(basePath, relativePath);
     const headResponse = await requestBytes(host, filePath, "HEAD", token);
     const response = headResponse.ok
@@ -199,7 +222,11 @@ async function listRemoteFiles(
         details: { lastModified },
       });
     }
-    return Math.trunc(parsed);
+    const etag = response.headers.get("etag") ?? undefined;
+    return {
+      mtimeMs: Math.trunc(parsed),
+      etag,
+    };
   }
 
   async function listDirectoryEntries(directoryPath: string): Promise<unknown[]> {
@@ -242,7 +269,7 @@ async function listRemoteFiles(
     });
   }
 
-  const result = new Map<string, number>();
+  const result = new Map<string, RemoteFileMeta>();
   const stack: Array<{ directoryPath: string; prefix: string }> = [{
     directoryPath: basePath,
     prefix: "",
@@ -296,17 +323,20 @@ async function listRemoteFiles(
       if (!key || isSyncMarker(key)) {
         continue;
       }
-      if (typeof entryTimestamp !== "number") {
-        entryTimestamp = await resolveRemoteMtimeMs(key);
+      let metadata: RemoteFileMeta;
+      if (typeof entryTimestamp === "number") {
+        metadata = { mtimeMs: entryTimestamp };
+      } else {
+        metadata = await fetchRemoteFileMeta(key);
       }
-      result.set(key, entryTimestamp);
+      result.set(key, metadata);
     }
   }
   return result;
 }
 
-async function listLocalFiles(rootPath: string): Promise<Map<string, number>> {
-  const result = new Map<string, number>();
+async function listLocalFiles(rootPath: string): Promise<Map<string, LocalFileMeta>> {
+  const result = new Map<string, LocalFileMeta>();
   const stack = [rootPath];
   while (stack.length > 0) {
     const current = stack.pop();
@@ -334,15 +364,49 @@ async function listLocalFiles(rootPath: string): Promise<Map<string, number>> {
           suggestion: "Ensure local files are on a filesystem with mtime support.",
         });
       }
-      result.set(relativePath, Math.trunc(mtimeMs));
+      result.set(relativePath, { mtimeMs: Math.trunc(mtimeMs) });
     }
   }
   return result;
 }
 
+function hasMeaningfulTimeDelta(
+  leftMs: number,
+  rightMs: number,
+): boolean {
+  return Math.abs(leftMs - rightMs) > CLOCK_SKEW_WINDOW_MS;
+}
+
+function hasRemoteChanged(
+  remote: RemoteFileMeta,
+  state?: SyncStateEntry,
+): boolean {
+  if (!state) {
+    return true;
+  }
+  if (hasMeaningfulTimeDelta(remote.mtimeMs, state.remoteMtimeMs)) {
+    return true;
+  }
+  if (state.remoteEtag && remote.etag && state.remoteEtag !== remote.etag) {
+    return true;
+  }
+  return false;
+}
+
+function hasLocalChanged(
+  local: LocalFileMeta,
+  state?: SyncStateEntry,
+): boolean {
+  if (!state) {
+    return true;
+  }
+  return hasMeaningfulTimeDelta(local.mtimeMs, state.localMtimeMs);
+}
+
 function planActions(
-  localFiles: Map<string, number>,
-  remoteFiles: Map<string, number>,
+  localFiles: Map<string, LocalFileMeta>,
+  remoteFiles: Map<string, RemoteFileMeta>,
+  stateFiles: Map<string, SyncStateEntry>,
   localMode?: SyncMode,
   remoteMode?: SyncMode,
 ): { actions: SyncAction[]; stats: SyncStats } {
@@ -380,42 +444,83 @@ function planActions(
   };
 
   for (const path of allPaths) {
-    const localMtimeMs = localFiles.get(path);
-    const remoteMtimeMs = remoteFiles.get(path);
+    const localMeta = localFiles.get(path);
+    const remoteMeta = remoteFiles.get(path);
+    const state = stateFiles.get(path);
 
-    if (typeof localMtimeMs === "number" && typeof remoteMtimeMs === "number") {
-      const delta = localMtimeMs - remoteMtimeMs;
-      if (Math.abs(delta) <= CLOCK_SKEW_WINDOW_MS) {
+    if (localMeta && remoteMeta) {
+      const localChanged = hasLocalChanged(localMeta, state);
+      const remoteChanged = hasRemoteChanged(remoteMeta, state);
+      if (!localChanged && !remoteChanged) {
         stats.noChange++;
         continue;
       }
-      if (delta > 0) {
-        actions.push({ type: "upload", relativePath: path, localMtimeMs });
+      if (localChanged && !remoteChanged) {
+        actions.push({
+          type: "upload",
+          relativePath: path,
+          localMtimeMs: localMeta.mtimeMs,
+        });
+        continue;
+      }
+      if (!localChanged && remoteChanged) {
+        actions.push({
+          type: "download",
+          relativePath: path,
+          remoteMtimeMs: remoteMeta.mtimeMs,
+        });
+        continue;
+      }
+      const delta = localMeta.mtimeMs - remoteMeta.mtimeMs;
+      if (Math.abs(delta) <= CLOCK_SKEW_WINDOW_MS) {
+        stats.noChange++;
+      } else if (delta > 0) {
+        actions.push({
+          type: "upload",
+          relativePath: path,
+          localMtimeMs: localMeta.mtimeMs,
+        });
       } else {
-        actions.push({ type: "download", relativePath: path, remoteMtimeMs });
+        actions.push({
+          type: "download",
+          relativePath: path,
+          remoteMtimeMs: remoteMeta.mtimeMs,
+        });
       }
       continue;
     }
 
-    if (typeof localMtimeMs === "number") {
+    if (localMeta) {
       if (remoteMode === "add") {
-        actions.push({ type: "upload", relativePath: path, localMtimeMs });
+        actions.push({
+          type: "upload",
+          relativePath: path,
+          localMtimeMs: localMeta.mtimeMs,
+        });
       } else if (localMode === "delete") {
-        actions.push({ type: "deleteLocal", relativePath: path, localMtimeMs });
+        actions.push({
+          type: "deleteLocal",
+          relativePath: path,
+          localMtimeMs: localMeta.mtimeMs,
+        });
       } else {
         stats.ignored++;
       }
       continue;
     }
 
-    if (typeof remoteMtimeMs === "number") {
+    if (remoteMeta) {
       if (localMode === "add") {
-        actions.push({ type: "download", relativePath: path, remoteMtimeMs });
+        actions.push({
+          type: "download",
+          relativePath: path,
+          remoteMtimeMs: remoteMeta.mtimeMs,
+        });
       } else if (remoteMode === "delete") {
         actions.push({
           type: "deleteRemote",
           relativePath: path,
-          remoteMtimeMs,
+          remoteMtimeMs: remoteMeta.mtimeMs,
         });
       } else {
         stats.ignored++;
@@ -536,6 +641,76 @@ async function writeSyncFile(rootPath: string, sitePath: string): Promise<void> 
   await Deno.writeTextFile(syncPath, `${sitePath}\n`);
 }
 
+async function readSyncState(
+  rootPath: string,
+  sitePath: string,
+): Promise<Map<string, SyncStateEntry>> {
+  const statePath = join(rootPath, SYNC_STATE_FILE_NAME);
+  try {
+    const raw = await Deno.readTextFile(statePath);
+    if (!raw.trim()) {
+      return new Map<string, SyncStateEntry>();
+    }
+    const parsed = JSON.parse(raw) as Partial<SyncStateFile>;
+    if (parsed.version !== 1 || parsed.siteRelativeUrl !== sitePath || !parsed.files) {
+      return new Map<string, SyncStateEntry>();
+    }
+    const entries = new Map<string, SyncStateEntry>();
+    for (const [path, value] of Object.entries(parsed.files)) {
+      if (!value || typeof value !== "object") {
+        continue;
+      }
+      const record = value as Partial<SyncStateEntry>;
+      if (
+        typeof record.localMtimeMs !== "number" ||
+        typeof record.remoteMtimeMs !== "number"
+      ) {
+        continue;
+      }
+      entries.set(path, {
+        localMtimeMs: Math.trunc(record.localMtimeMs),
+        remoteMtimeMs: Math.trunc(record.remoteMtimeMs),
+        remoteEtag: typeof record.remoteEtag === "string"
+          ? record.remoteEtag
+          : undefined,
+      });
+    }
+    return entries;
+  } catch (error) {
+    if (error instanceof Deno.errors.NotFound) {
+      return new Map<string, SyncStateEntry>();
+    }
+    return new Map<string, SyncStateEntry>();
+  }
+}
+
+async function writeSyncState(
+  rootPath: string,
+  sitePath: string,
+  localFiles: Map<string, LocalFileMeta>,
+  remoteFiles: Map<string, RemoteFileMeta>,
+): Promise<void> {
+  const files: Record<string, SyncStateEntry> = {};
+  for (const [path, localMeta] of localFiles.entries()) {
+    const remoteMeta = remoteFiles.get(path);
+    if (!remoteMeta) {
+      continue;
+    }
+    files[path] = {
+      localMtimeMs: localMeta.mtimeMs,
+      remoteMtimeMs: remoteMeta.mtimeMs,
+      remoteEtag: remoteMeta.etag,
+    };
+  }
+  const payload: SyncStateFile = {
+    version: 1,
+    siteRelativeUrl: sitePath,
+    files,
+  };
+  const statePath = join(rootPath, SYNC_STATE_FILE_NAME);
+  await Deno.writeTextFile(statePath, JSON.stringify(payload, null, 2));
+}
+
 export const SYNC_DESCRIPTION =
   "Sync a local directory with a remote Restspace directory (previews changes and asks for confirmation unless --yes is provided).";
 
@@ -580,10 +755,12 @@ export async function runSync(
     listLocalFiles(localRoot),
     listRemoteFiles(host, token, resolvedSitePath),
   ]);
+  const stateFiles = await readSyncState(localRoot, resolvedSitePath);
 
   const { actions, stats } = planActions(
     localFiles,
     remoteFiles,
+    stateFiles,
     localMode,
     remoteMode,
   );
@@ -629,6 +806,10 @@ export async function runSync(
 
   await writeSyncFile(localRoot, resolvedSitePath);
 
+  if (actions.length === 0) {
+    await writeSyncState(localRoot, resolvedSitePath, localFiles, remoteFiles);
+  }
+
   const failures: Array<{ action: SyncActionType; path: string; error: string }> = [];
   for (const action of actions) {
     try {
@@ -657,6 +838,19 @@ export async function runSync(
       stats,
       failures,
     });
+  }
+
+  if (actions.length > 0) {
+    const [nextLocalFiles, nextRemoteFiles] = await Promise.all([
+      listLocalFiles(localRoot),
+      listRemoteFiles(host, token, resolvedSitePath),
+    ]);
+    await writeSyncState(
+      localRoot,
+      resolvedSitePath,
+      nextLocalFiles,
+      nextRemoteFiles,
+    );
   }
 
   writeSuccess({
