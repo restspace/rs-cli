@@ -1,0 +1,13 @@
+{
+  "name": "rs-cli-dev",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Developer scripts for the rs Deno CLI",
+  "scripts": {
+    "dev": "deno task dev",
+    "build": "deno task build",
+    "build:strict": "deno task build:strict",
+    "build:win": "deno task build:win",
+    "publish:global": "deno task publish:global"
+  }
+}

@@ -1,8 +1,13 @@
 {
   "name": "rs",
   "version": "0.1.0",
+  "exports": "./src/main.ts",
   "tasks": {
-    "dev": "deno run -A src/main.ts"
+    "dev": "deno run -A src/main.ts",
+    "build": "deno compile -A --no-check --config deno.json --output dist/rs src/main.ts",
+    "build:strict": "deno compile -A --config deno.json --output dist/rs src/main.ts",
+    "build:win": "deno compile -A --no-check --config deno.json --output dist/rs.exe src/main.ts",
+    "publish:global": "deno install -A --global --name rs -f --config deno.json src/main.ts"
   },
   "imports": {
     "cliffy/": "https://deno.land/x/cliffy@v1.0.0-rc.4/",

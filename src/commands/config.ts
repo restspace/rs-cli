@@ -29,7 +29,11 @@ function normalizeAndValidateHost(host: string): string {
 }
 
 export function configCommand(): Command {
-  const command = new Command().description("Manage CLI configuration.");
+  const command = new Command()
+    .description("Manage CLI configuration.\n\nConfigurable values: host, email, password")
+    .action(function () {
+      this.showHelp();
+    });
 
   command.command("init")
     .description("Create a config file.")

@@ -1,1 +1,178 @@
-{}
+{
+  "transform": {
+    "name": "Transform",
+    "description": "Receives and sends data, having applied some operation to the data.",
+    "methods": {
+      "POST": {
+        "description": "Send data and receive transformed result",
+        "hasRequestBody": true,
+        "hasResponseBody": true
+      }
+    }
+  },
+  "view": {
+    "name": "View",
+    "description": "Sends data only. A read-only endpoint.",
+    "methods": {
+      "GET": {
+        "description": "Get the data",
+        "hasRequestBody": false,
+        "hasResponseBody": true
+      }
+    }
+  },
+  "operation": {
+    "name": "Operation",
+    "description": "Receives data only and returns an empty response.",
+    "methods": {
+      "POST": {
+        "description": "Send data to trigger an operation",
+        "hasRequestBody": true,
+        "hasResponseBody": false
+      }
+    }
+  },
+  "directory": {
+    "name": "Directory",
+    "description": "Does not receive or send data itself, exists only to contain other resources.",
+    "methods": {
+      "GET": {
+        "description": "List directory contents (path must end with /)",
+        "pathFormat": "{basePath}/",
+        "hasRequestBody": false,
+        "hasResponseBody": true
+      }
+    }
+  },
+  "store": {
+    "name": "Store",
+    "description": "Receives and sends data, persisting each resource. A RESTful CRUD directory.",
+    "methods": {
+      "GET": {
+        "description": "Read the stored resource",
+        "hasRequestBody": false,
+        "hasResponseBody": true
+      },
+      "PUT": {
+        "description": "Create or update resource (no response body)",
+        "hasRequestBody": true,
+        "hasResponseBody": false
+      },
+      "POST": {
+        "description": "Create or update resource (returns stored data)",
+        "hasRequestBody": true,
+        "hasResponseBody": true
+      },
+      "DELETE": {
+        "description": "Delete the resource",
+        "hasRequestBody": false,
+        "hasResponseBody": false
+      }
+    }
+  },
+  "store-transform": {
+    "name": "StoreTransform",
+    "description": "Combines Store and Transform. Store a configuration/script via PUT, then POST data to transform using that configuration.",
+    "methods": {
+      "GET": {
+        "description": "Read the stored configuration/script",
+        "hasRequestBody": false,
+        "hasResponseBody": true
+      },
+      "PUT": {
+        "description": "Store configuration/script",
+        "hasRequestBody": true,
+        "hasResponseBody": false
+      },
+      "POST": {
+        "description": "Transform data using the stored configuration",
+        "hasRequestBody": true,
+        "hasResponseBody": true
+      },
+      "DELETE": {
+        "description": "Delete the configuration/script",
+        "hasRequestBody": false,
+        "hasResponseBody": false
+      }
+    },
+    "example": "HTML templates: PUT a template, then POST data to receive filled-in template"
+  },
+  "store-view": {
+    "name": "StoreView",
+    "description": "Like StoreTransform but POST requires no input data (like a view).",
+    "methods": {
+      "GET": {
+        "description": "Read the stored configuration",
+        "hasRequestBody": false,
+        "hasResponseBody": true
+      },
+      "PUT": {
+        "description": "Store configuration",
+        "hasRequestBody": true,
+        "hasResponseBody": false
+      },
+      "POST": {
+        "description": "Execute with empty body to get result",
+        "hasRequestBody": false,
+        "hasResponseBody": true
+      },
+      "DELETE": {
+        "description": "Delete the configuration",
+        "hasRequestBody": false,
+        "hasResponseBody": false
+      }
+    }
+  },
+  "store-operation": {
+    "name": "StoreOperation",
+    "description": "Like StoreTransform but POST returns an empty response.",
+    "methods": {
+      "GET": {
+        "description": "Read the stored configuration",
+        "hasRequestBody": false,
+        "hasResponseBody": true
+      },
+      "PUT": {
+        "description": "Store configuration",
+        "hasRequestBody": true,
+        "hasResponseBody": false
+      },
+      "POST": {
+        "description": "Execute operation (no response body)",
+        "hasRequestBody": true,
+        "hasResponseBody": false
+      },
+      "DELETE": {
+        "description": "Delete the configuration",
+        "hasRequestBody": false,
+        "hasResponseBody": false
+      }
+    }
+  },
+  "store-directory": {
+    "name": "StoreDirectory",
+    "description": "Like Store but stored data files configure multiple endpoints in a subdirectory.",
+    "methods": {
+      "GET": {
+        "description": "Read the stored configuration or list subdirectory",
+        "hasRequestBody": false,
+        "hasResponseBody": true
+      },
+      "PUT": {
+        "description": "Store configuration (creates subdirectory with endpoints)",
+        "hasRequestBody": true,
+        "hasResponseBody": false
+      },
+      "DELETE": {
+        "description": "Delete configuration and its subdirectory",
+        "hasRequestBody": false,
+        "hasResponseBody": false
+      }
+    },
+    "example": "StoreTimer service: PUT config to /timers/timer01, then access /timers/timer01/start"
+  },
+  "_discovery": {
+    "description": "Discover the pattern of any API directory by listing with the 'details' flag",
+    "example": "GET {basePath}/?details"
+  }
+}

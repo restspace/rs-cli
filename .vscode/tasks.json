@@ -1,0 +1,40 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "rs: dev",
+      "type": "shell",
+      "command": "npm run dev",
+      "group": "build",
+      "problemMatcher": []
+    },
+    {
+      "label": "rs: build",
+      "type": "shell",
+      "command": "npm run build",
+      "group": "build",
+      "problemMatcher": []
+    },
+    {
+      "label": "rs: build:strict",
+      "type": "shell",
+      "command": "npm run build:strict",
+      "group": "build",
+      "problemMatcher": []
+    },
+    {
+      "label": "rs: build:win",
+      "type": "shell",
+      "command": "npm run build:win",
+      "group": "build",
+      "problemMatcher": []
+    },
+    {
+      "label": "rs: publish:global",
+      "type": "shell",
+      "command": "npm run publish:global",
+      "group": "none",
+      "problemMatcher": []
+    }
+  ]
+}

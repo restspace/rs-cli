@@ -2,6 +2,14 @@
 
 This project uses **bd** (beads) for issue tracking. Run `bd onboard` to get started.
 
+## Installation
+
+To install the CLI globally:
+
+```bash
+deno install -A --global --name rs -f --config deno.json src/main.ts
+```
+
 ## Quick Reference
 
 ```bash

@@ -1,1 +1,289 @@
-{}
+{
+  "_overview": {
+    "description": "Restspace services are modular components that handle HTTP requests. Each service is configured with a source URL, base path, access control, and optional adapter.",
+    "configuration": {
+      "name": "Human-readable service name",
+      "source": "URL to service manifest (.rsm.json)",
+      "basePath": "URL path where service is mounted",
+      "access": {
+        "readRoles": "Comma-separated roles for read access (U, E, A, or *)",
+        "writeRoles": "Comma-separated roles for write access"
+      },
+      "adapterSource": "URL to adapter manifest (.ram.json)",
+      "adapterConfig": "Configuration object passed to adapter",
+      "prePipeline": "Pipeline to run before service handler",
+      "postPipeline": "Pipeline to run after service handler"
+    },
+    "roles": {
+      "U": "User - authenticated user",
+      "E": "Editor - can modify content",
+      "A": "Admin - full access",
+      "*": "All - including anonymous"
+    }
+  },
+  "data": {
+    "name": "Data Service",
+    "description": "Read/write generic data from data stores by key. The fundamental storage service.",
+    "source": "data.rsm.json",
+    "pattern": "store",
+    "apis": ["store", "data.base"],
+    "adapterInterface": "IDataAdapter",
+    "config": {
+      "uploadBaseUrl": "URL to file store for handling attachments"
+    },
+    "adapters": ["MongoDbDataAdapter", "ElasticsearchDataAdapter"],
+    "examples": {
+      "GET /data/users/123": "Read user with key 123",
+      "PUT /data/users/123": "Create or update user 123",
+      "DELETE /data/users/123": "Delete user 123"
+    }
+  },
+  "dataset": {
+    "name": "Dataset Service",
+    "description": "Read/write data with JSON Schema validation. Enforces data structure.",
+    "source": "dataset.rsm.json",
+    "pattern": "store",
+    "apis": ["store", "data.set"],
+    "adapterInterface": "IDataAdapter",
+    "config": {
+      "datasetName": "Name for the dataset",
+      "schema": "JSON Schema for validation",
+      "uploadBaseUrl": "URL to file store",
+      "enforceSchema": "Whether to enforce schema validation (boolean)"
+    },
+    "adapters": ["MongoDbDataAdapter", "ElasticsearchDataAdapter"]
+  },
+  "file": {
+    "name": "File Service",
+    "description": "Get/PUT files with optional path tree substitution and directory handling.",
+    "source": "file.rsm.json",
+    "pattern": "store",
+    "apis": ["store", "file.base"],
+    "adapterInterface": "IFileAdapter",
+    "config": {
+      "extensions": "Allowed file extensions (array)",
+      "parentIfMissing": "Serve parent file if requested file missing",
+      "defaultResource": "File to serve when directory requested",
+      "storePattern": "API pattern type"
+    },
+    "adapters": ["LocalFileAdapter", "S3FileAdapter"]
+  },
+  "static-site": {
+    "name": "Static Site Service",
+    "description": "Host a static site with SPA routing support. Rewrites paths for single-page apps.",
+    "source": "file.rsm.json with static-site-filter",
+    "pattern": "store",
+    "apis": ["store", "file.base"],
+    "adapterInterface": "IFileAdapter",
+    "features": ["SPA routing", "Directory rewriting", "Default index handling"]
+  },
+  "template": {
+    "name": "Template Service",
+    "description": "Store templates and fill them with POST request data. Supports multiple template engines.",
+    "source": "template.rsm.json",
+    "pattern": "store-transform",
+    "apis": ["store-transform"],
+    "adapterInterface": "ITemplateAdapter",
+    "config": {
+      "outputMime": "Output MIME type",
+      "metadataProperty": "Property for template metadata",
+      "store": "Store configuration for templates"
+    },
+    "adapters": ["NunjucksTemplateAdapter", "JsxTemplateAdapter"],
+    "usage": {
+      "PUT /templates/welcome.html": "Store a template",
+      "POST /templates/welcome.html": "Render template with posted JSON data",
+      "GET /templates/welcome.html": "Read the raw template"
+    }
+  },
+  "query": {
+    "name": "Query Service",
+    "description": "Store queries and run them parametrized by POST body. Supports complex database queries.",
+    "source": "query.rsm.json",
+    "pattern": "store-transform",
+    "apis": ["store-transform", "file.base"],
+    "adapterInterface": "IQueryAdapter",
+    "config": {
+      "outputMime": "Output MIME type",
+      "store": "Store configuration for query files"
+    },
+    "adapters": ["MongoDbQueryAdapter", "ElasticsearchQueryAdapter"],
+    "usage": {
+      "PUT /queries/active-users": "Store a query definition",
+      "POST /queries/active-users": "Execute query with parameters from POST body",
+      "GET /queries/active-users": "Read the raw query definition"
+    }
+  },
+  "pipeline": {
+    "name": "Pipeline Service",
+    "description": "Chain multiple service calls with data transformation between them.",
+    "source": "pipeline.rsm.json",
+    "pattern": "transform",
+    "apis": ["transform", "pipeline"],
+    "features": ["Sequential execution", "Parallel execution", "Conditional branching", "Variable capture"]
+  },
+  "pipeline-store": {
+    "name": "Pipeline Store Service",
+    "description": "Store pipeline specifications and run them. Combines persistence with execution.",
+    "source": "pipelineStore.rsm.json",
+    "pattern": "store-transform",
+    "apis": ["store-transform", "file.base"],
+    "config": {
+      "store": "Store configuration for pipeline specs"
+    },
+    "usage": {
+      "PUT /pipelines/my-workflow": "Store a pipeline specification",
+      "POST /pipelines/my-workflow": "Execute the stored pipeline with input data",
+      "GET /pipelines/my-workflow": "Read the pipeline specification"
+    }
+  },
+  "auth": {
+    "name": "Auth Service",
+    "description": "JWT authentication with role-based access control. Issues and validates tokens.",
+    "source": "auth.rsm.json",
+    "pattern": "directory",
+    "apis": ["auth"],
+    "config": {
+      "userUrlPattern": "URL pattern to fetch user data",
+      "loginPage": "Login page URL for redirect",
+      "sessionTimeoutMins": "Session timeout in minutes (default: indefinite)",
+      "jwtUserProps": "Extra user properties to embed in JWT"
+    },
+    "endpoints": {
+      "POST /auth/login": "Authenticate with email/password, returns JWT cookie",
+      "GET /auth/user": "Get current user info",
+      "POST /auth/logout": "Clear authentication"
+    }
+  },
+  "account": {
+    "name": "Account Service",
+    "description": "Password reset and email verification flows.",
+    "source": "account.rsm.json",
+    "pattern": "directory",
+    "apis": ["account"],
+    "config": {
+      "userUrlPattern": "URL pattern for user data",
+      "emailSendUrlPattern": "URL pattern to send emails",
+      "passwordReset": {
+        "tokenExpiryMins": "Token validity in minutes",
+        "returnPageUrl": "Page to redirect after reset",
+        "emailTemplateUrl": "Email template URL"
+      },
+      "emailConfirm": "Email confirmation configuration"
+    }
+  },
+  "email": {
+    "name": "Email Service",
+    "description": "Send emails with optional attachments via SMTP.",
+    "source": "email.rsm.json",
+    "pattern": "operation",
+    "apis": ["email"],
+    "config": {
+      "host": "SMTP server host",
+      "port": "SMTP port",
+      "secure": "Use TLS (boolean)",
+      "user": "SMTP username",
+      "password": "SMTP password",
+      "defaultFrom": "Default sender address"
+    }
+  },
+  "timer": {
+    "name": "Timer Service",
+    "description": "Trigger a URL at regular intervals. Useful for scheduled tasks.",
+    "source": "timer.rsm.json",
+    "pattern": "directory",
+    "apis": ["directory"],
+    "config": {
+      "triggerUrl": "URL to POST to every interval",
+      "repeatDuration": "ISO 8601 duration between triggers (e.g., PT1H for hourly)",
+      "maxRandomAdditionalMs": "Random jitter in milliseconds",
+      "autoStart": "Auto-start on initialization (boolean)"
+    },
+    "endpoints": {
+      "POST /timer/start": "Start the timer",
+      "POST /timer/stop": "Stop the timer"
+    }
+  },
+  "timer-store": {
+    "name": "Timer Store Service",
+    "description": "Store timer specifications and manage multiple timers.",
+    "source": "timerStore.rsm.json",
+    "pattern": "store-directory",
+    "apis": ["store-directory", "data.set"],
+    "config": {
+      "store": "Store configuration for timer specs"
+    },
+    "usage": {
+      "PUT /timers/daily-report": "Store timer configuration",
+      "POST /timers/daily-report/start": "Start the timer",
+      "POST /timers/daily-report/stop": "Stop the timer"
+    }
+  },
+  "webhooks": {
+    "name": "Webhooks Service",
+    "description": "Lightweight webhook registry and dispatcher with retry support.",
+    "source": "webhooks.rsm.json",
+    "pattern": "store-transform",
+    "apis": ["store-transform"],
+    "config": {
+      "concurrency": "Max concurrent deliveries",
+      "retryCount": "Retries on failure",
+      "store": "Registrant store configuration"
+    },
+    "usage": {
+      "PUT /webhooks/user-created": "Register a webhook endpoint",
+      "POST /webhooks/user-created": "Trigger the webhook with event data"
+    }
+  },
+  "proxy": {
+    "name": "Proxy Service",
+    "description": "Forward requests with server-defined auth or URLs. Useful for API integration.",
+    "source": "proxy.rsm.json",
+    "pattern": "transform",
+    "apis": ["proxy", "transform"],
+    "config": {
+      "corsAllowedHeaders": "Allowed CORS headers",
+      "urlPattern": "Target URL pattern with substitution"
+    },
+    "adapters": ["SimpleProxyAdapter", "Aws4ProxyAdapter", "SlackProxyAdapter", "DiscordProxyAdapter"]
+  },
+  "sse": {
+    "name": "Server-Side Events Service",
+    "description": "Manage SSE connections to multiple clients for real-time updates.",
+    "source": "sse.rsm.json",
+    "pattern": "directory",
+    "apis": ["directory"],
+    "features": ["Client connection management", "Event broadcasting", "Channel support"]
+  },
+  "services": {
+    "name": "Services Service",
+    "description": "Discovery endpoint for configured services. Provides service catalogue and metadata.",
+    "source": "services.rsm.json",
+    "pattern": "directory",
+    "apis": ["services"],
+    "endpoints": {
+      "GET /.well-known/restspace/services": "List all configured services",
+      "GET /.well-known/restspace/services/catalogue": "Full service and adapter catalogue",
+      "GET /.well-known/restspace/services/agent-discovery": "Agent discovery information",
+      "GET /.well-known/restspace/services/openApi": "OpenAPI specification"
+    }
+  },
+  "temporary-access": {
+    "name": "Temporary Access Service",
+    "description": "Generate tokens for temporary resource access with elevated roles.",
+    "source": "temporaryAccess.rsm.json",
+    "pattern": "operation",
+    "apis": ["access-token"],
+    "config": {
+      "acquiredRole": "Role granted by token",
+      "expirySecs": "Token validity duration in seconds"
+    }
+  },
+  "user-filter": {
+    "name": "User Filter Service",
+    "description": "Filter service that manages passwords and restricts operations to specific users.",
+    "source": "userFilter.rsm.json",
+    "isFilter": true,
+    "features": ["Password validation", "User operation restrictions", "Pre-pipeline integration"]
+  }
+}

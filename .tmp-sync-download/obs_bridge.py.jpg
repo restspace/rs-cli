@@ -1,0 +1,262 @@
+import asyncio
+import json
+import logging
+import os
+import platform
+import cv2 # OpenCV for webcam access
+from aiortc.contrib.media import MediaPlayer, MediaRelay
+from aiohttp import web
+from aiortc import RTCPeerConnection, RTCSessionDescription  # RTCIceCandidate unused currently
+import subprocess
+import time
+import sys
+
+ROOT = os.path.dirname(__file__)
+relay = None
+webcam = None
+
+# Function to find the OBS Virtual Camera
+# This is a common source of issues - the index might vary!
+def find_obs_virtual_camera():
+    # On Windows, OBS Virtual Cam might have a specific backend preference.
+    # We'll iterate through available cameras.
+    # You might need to experiment with the index.
+    # Common indices are 0, 1, 2, etc.
+    # Check your system's camera list.
+    for i in range(5): # Check first 5 camera indices
+        cap = cv2.VideoCapture(i, cv2.CAP_DSHOW if platform.system() == "Windows" else None) # Use CAP_DSHOW on Windows for better compatibility
+        if cap.isOpened():
+            # You could try to read a frame and check its properties,
+            # or look for a specific name if the backend allows.
+            # For now, we assume if it opens, it *could* be it.
+            # A more robust method might involve checking camera names if cv2 backend supports it.
+            print(f"Camera index {i} opened successfully.")
+            # To be more certain, you might need to manually identify which index is OBS Virtual Cam
+            # by testing each one.
+            # For this example, let's assume you've found it.
+            # Let's say OBS Virtual Cam is often one of the higher indexed cameras if you have physical webcams.
+            #
+            # **MANUALLY SET THIS AFTER TESTING WHICH INDEX IS OBS VIRTUAL CAM**
+            # For example, if you find OBS Virtual Cam is index 1:
+            # if i == 1:
+            #     print(f"Assuming camera index {i} is OBS Virtual Camera.")
+            #     cap.release()
+            #     return str(i) # MediaPlayer expects a string for device index
+
+            # For now, just release and let the user configure
+            cap.release()
+        else:
+            print(f"Camera index {i} failed to open.")
+    
+    # ** Fallback / User instruction **
+    print("\n************************************************************************************")
+    print("COULD NOT AUTO-DETECT OBS VIRTUAL CAMERA INDEX.")
+    print("Please identify the correct camera index for OBS Virtual Camera on your system.")
+    print("Then, modify the 'find_obs_virtual_camera' function in server.py or directly set")
+    print("the 'device' variable in 'create_webcam_stream' to, for example, 'device': '1'")
+    print("if OBS Virtual Cam is index 1.")
+    print("************************************************************************************\n")
+    return None # Or a default you know works, e.g. '0' or '1'
+
+# Global variable for the OBS Virtual Camera device string
+# ** YOU MIGHT NEED TO CHANGE THIS '0', '1', '2' etc. **
+# Try to find it automatically or manually set it after testing.
+# obs_camera_device_idx_str = find_obs_virtual_camera()
+# Forcing it for now - PLEASE CHANGE THIS IF NEEDED:
+obs_camera_device_idx_str = "0" # START WITH 0, THEN TRY 1, 2, etc. if OBS Virtual Cam is not found.
+
+def _cors_headers():
+    """Common CORS headers for all responses."""
+    return {
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Methods": "POST, OPTIONS",
+        "Access-Control-Allow-Headers": "Content-Type",
+    }
+
+async def webrtc_offer(request):
+    params = await request.json()
+    offer = RTCSessionDescription(sdp=params["sdp"], type=params["type"])
+
+    pc = RTCPeerConnection()
+    pcs.add(pc)
+
+    @pc.on("connectionstatechange")
+    async def on_connectionstatechange():
+        print(f"PC Connection state is {pc.connectionState}")
+        if pc.connectionState == "failed":
+            await pc.close()
+            pcs.discard(pc)
+        elif pc.connectionState == "closed":
+            pcs.discard(pc)
+
+    @pc.on("icecandidate")
+    async def on_icecandidate(candidate):
+        # This is for Trickle ICE; your client doesn't seem to send candidates separately
+        # after the initial offer, but good to have.
+        if candidate:
+            print(f"PC ICE candidate: {candidate}")
+
+    global relay, webcam
+    if webcam is None:
+        print(f"Attempting to access OBS Virtual Camera at index: {obs_camera_device_idx_str}")
+        if obs_camera_device_idx_str is None:
+            return web.Response(
+                content_type="application/json",
+                text=json.dumps({"error": "OBS Virtual Camera not configured on server."}),
+                status=500
+            )
+        
+        # --- FFmpeg / dshow capture options ---
+        #   OBS Virtual Camera defaults to 1280x720 @ 30 fps in YUY2.
+        #   Supplying these explicitly avoids ffmpeg picking an unsupported
+        #   pixel-format and silently returning black frames.
+        options = {
+            "framerate": "30",
+            "video_size": "1280x720",  # match your OBS Virtual Cam output
+            # Most Windows virtual-cam drivers expose YUY2 / YUYV422.
+            # Explicitly request it so the decoder chain knows how to convert.
+            "pixel_format": "yuyv422",
+            # Increase realtime buffer size – reduces frame drops on high-res
+            "rtbufsize": "702000k",
+        }
+
+        if platform.system() == "Windows":
+            webcam = MediaPlayer(f"video=OBS Virtual Camera", format="dshow", options=options) # Try by name first
+            if not webcam or not webcam.video: # Fallback to index if name doesn't work
+                print(f"Could not open OBS Virtual Camera by name, trying index {obs_camera_device_idx_str} with dshow")
+                webcam = MediaPlayer(obs_camera_device_idx_str, format="dshow" if platform.system() == "Windows" else None, options=options)
+        else:
+             webcam = MediaPlayer(obs_camera_device_idx_str, options=options)
+
+        # Log the selected input – helps diagnose "black frame" issues.
+        if webcam and webcam.video:
+            print("✅ Opened OBS Virtual Camera via FFmpeg –", webcam)
+        else:
+            print("❌ FFmpeg opened the device but video track is empty – check pixel_format / video_size")
+
+        if not webcam or not webcam.video: # Check if webcam.video track exists
+             print("ERROR: Could not get video track from OBS Virtual Camera / MediaPlayer")
+             return web.Response(
+                content_type="application/json",
+                text=json.dumps({"error": "Could not access OBS Virtual Camera."}),
+                status=500
+            )
+        relay = MediaRelay()
+
+
+    # Add the video track from the webcam (OBS Virtual Cam) to the peer connection
+    # This makes the peer connection a SENDER of this track.
+    pc.addTrack(relay.subscribe(webcam.video))
+
+
+    await pc.setRemoteDescription(offer)
+    print("Offer set as remote description")
+
+    answer = await pc.createAnswer()
+    await pc.setLocalDescription(answer)
+    print("Answer created and set as local description")
+
+    return web.Response(
+        content_type="application/json",
+        text=json.dumps(
+            {"sdp": pc.localDescription.sdp, "type": pc.localDescription.type}
+        ),
+        headers=_cors_headers(),
+    )
+
+pcs = set()
+
+async def on_shutdown(app):
+    # close peer connections
+    coros = [pc.close() for pc in pcs]
+    await asyncio.gather(*coros)
+    pcs.clear()
+    if webcam and webcam.video and hasattr(webcam.video, 'stop'): # Ensure track exists and has stop()
+        webcam.video.stop()
+
+
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
+    
+    # --------------------------------------------------------------------------
+    # 1.  Paths
+    # --------------------------------------------------------------------------
+    BLENDER_DIR      = r"C:\Program Files\Blender Foundation\Blender 4.3"
+    BLENDER_EXEC     = os.path.join(BLENDER_DIR, "blender.exe")
+
+    OBS_DIR          = r"C:\Program Files\obs-studio\bin\64bit"
+    OBS_EXEC         = os.path.join(OBS_DIR, "obs64.exe")
+    OBS_INIT_WAIT_TIME = 1  # seconds to wait after starting OBS
+
+    # ------------------------------------------------------------------
+    # Optional: Blend file to open automatically.
+    # Edit this path if you want Blender to open a specific scene.
+    # ------------------------------------------------------------------
+    #DEFAULT_BLEND = os.path.join(ROOT, "testscene.blend")  # falls back to blank scene if not found
+    DEFAULT_BLEND = "D:/Dropbox/Blender/projects/Atelyr/BlankCyclesScene.blend"
+
+    # Blender startup script – run the WebRTC server inside Blender
+    blender_startup_py = os.path.join(ROOT, "blender_webrtc_server.py")
+
+    # --------------------------------------------------------------------------
+    # 2.  Launch OBS (only if it is not already running)
+    # --------------------------------------------------------------------------
+    logging.info("Checking if OBS is already running …")
+
+    obs_running = False
+    try:
+        result = subprocess.run(
+            ['tasklist', '/FI', 'IMAGENAME eq obs64.exe'],
+            capture_output=True, text=True, check=False
+        )
+        obs_running = 'obs64.exe' in result.stdout
+    except Exception as e:
+        logging.warning(f"Could not determine if OBS is running: {e}")
+
+    if obs_running:
+        logging.info("OBS is already running – skipping launch.")
+    else:
+        logging.info("Starting OBS …")
+        try:
+            subprocess.Popen([
+                OBS_EXEC,
+                "--startvirtualcam"
+            ], cwd=OBS_DIR)
+            logging.info(f"OBS started, waiting {OBS_INIT_WAIT_TIME} s for it to finish initialising…")
+            time.sleep(OBS_INIT_WAIT_TIME)
+        except FileNotFoundError:
+            logging.error(f"OBS not found at {OBS_EXEC}")
+            sys.exit(1)
+
+    # --------------------------------------------------------------------------
+    # 3.  Launch Blender
+    # --------------------------------------------------------------------------
+    logging.info("Starting Blender …")
+    try:
+        blender_cmd = [BLENDER_EXEC, "--gpu-backend", "opengl"]
+
+        # If a .blend file exists, load it first.
+        if os.path.exists(DEFAULT_BLEND):
+            blender_cmd.append(DEFAULT_BLEND)
+
+        # Start the embedded WebRTC server script if present
+        if os.path.exists(blender_startup_py):
+            blender_cmd.extend(["--python", blender_startup_py])
+
+        blender_cmd.extend(["--window-geometry", "0", "0", "1488", "591"])
+
+        # NOTE: give BLENDER_DIR as the working directory
+        subprocess.Popen(blender_cmd, cwd=BLENDER_DIR)
+        logging.info("Blender launched.")
+        time.sleep(5)
+    except FileNotFoundError:
+        logging.error(f"Blender not found at {BLENDER_EXEC}")
+        sys.exit(1)
+
+    # ------------------------------------------------------------------
+    # 4.  Hand-off to Blender's embedded WebRTC server
+    # ------------------------------------------------------------------
+
+    print("OBS and Blender launched – WebRTC server will run inside Blender. Exiting obs_bridge.")
+    # Give subprocesses a second to detach, then terminate this helper script.
+    sys.exit(0)

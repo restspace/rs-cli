@@ -16,18 +16,14 @@ function normalizeExpiry(value: number): number {
   return value > 1_000_000_000_000 ? Math.floor(value / 1000) : value;
 }
 
-function extractToken(payload: unknown): string | undefined {
-  if (!payload || typeof payload !== "object") {
+function extractTokenFromCookie(headers: Record<string, string>): string | undefined {
+  const setCookie = headers["set-cookie"];
+  if (!setCookie) {
     return undefined;
   }
-  const record = payload as Record<string, unknown>;
-  for (const key of ["token", "jwt", "accessToken", "authToken"]) {
-    const value = record[key];
-    if (typeof value === "string" && value.length > 0) {
-      return value;
-    }
-  }
-  return undefined;
+  // Parse rs-auth cookie value from set-cookie header
+  const match = setCookie.match(/rs-auth=([^;]+)/);
+  return match ? match[1] : undefined;
 }
 
 function extractExpiry(payload: unknown): number | undefined {
@@ -143,12 +139,12 @@ export function registerAuthCommands(app: Command): void {
         });
       }
 
-      const token = extractToken(response.data);
+      const token = extractTokenFromCookie(response.headers);
       if (!token) {
         writeError({
           status: response.status,
-          error: "Login response did not include a token.",
-          suggestion: "Check the server login response format.",
+          error: "Login response did not include rs-auth cookie.",
+          suggestion: "Check the server login response.",
         });
       }
 
@@ -213,7 +209,7 @@ export function registerAuthCommands(app: Command): void {
       const client = new ApiClient(host, token);
       let response: ApiResponse;
       try {
-        response = await client.request("GET", "/auth/whoami");
+        response = await client.request("GET", "/auth/user");
       } catch (error) {
         writeError({
           error: error instanceof Error ? error.message : String(error),

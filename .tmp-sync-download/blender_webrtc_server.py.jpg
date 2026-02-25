@@ -1,0 +1,1274 @@
+"""
+Blender WebRTC Server:
+- Sets up a Blender scene by loading a GLB and configuring Cycles.
+- Starts an aiohttp/aiortc WebRTC server.
+- Video Source: OBS Virtual Camera (requires OpenCV and relevant aiortc components).
+- Data Channel: Listens for commands to be executed in Blender.
+
+To run this script, launch Blender using a command like:
+    blender.exe --gpu-backend opengl --python scripts/blender_webrtc_server.py
+
+Ensure Blender's Python environment has: aiohttp, aiortc, opencv-python, av, pylibsrtp.
+"""
+import bpy
+import os
+import sys
+import pathlib
+import logging
+import asyncio
+import json
+import platform
+import time  # For potential delays if needed or data channel message timing
+import threading  # Needed for server thread management
+import math  # Camera FOV conversion and other math helpers
+import aiofiles
+
+# --- Attempt to import necessary WebRTC and video libraries ---
+# These must be installed in Blender's Python environment.
+try:
+    import cv2
+except ImportError as e_cv2:
+    logging.warning(f"OpenCV (cv2) not found, video streaming from OBS will fail: {e_cv2}")
+    cv2 = None
+
+try:
+    from aiortc.contrib.media import MediaPlayer, MediaRelay
+except ImportError as e_aiortc_media:
+    logging.warning(f"aiortc.contrib.media (MediaPlayer, MediaRelay) not found, video streaming from OBS will fail: {e_aiortc_media}")
+    MediaPlayer = None
+    MediaRelay = None
+
+try:
+    from aiohttp import web
+except ImportError as e_aiohttp:
+    logging.error(f"aiohttp not found, WebRTC server cannot start: {e_aiohttp}")
+    web = None # Critical
+
+try:
+    from aiortc import RTCPeerConnection, RTCSessionDescription, RTCConfiguration, RTCIceServer, RTCDataChannel
+except ImportError as e_aiortc_core:
+    logging.error(f"aiortc core components not found, WebRTC server cannot start: {e_aiortc_core}")
+    RTCPeerConnection = None # Critical
+    RTCSessionDescription = None
+    RTCConfiguration = None
+    RTCIceServer = None
+    RTCDataChannel = None
+
+if web is None or RTCPeerConnection is None:
+    logging.error("Critical server libraries (aiohttp or aiortc base) failed to import. This script will not be able to run the WebRTC server. Exiting.")
+    sys.exit(1) # Exit if essential server components are missing
+
+# -----------------------------------------------------------------------------
+# Configuration
+# -----------------------------------------------------------------------------
+# GLB_PATH = pathlib.Path(r"D:\Dropbox\Blender\projects\Atelyr\DemoBathroom\DemoBathroom_Export.glb")
+GLB_MODEL_PATH = pathlib.Path(r"D:\Dropbox\Blender\projects\Atelyr\Objects\\")
+GLB_MODEL_UPLOAD_PATH = pathlib.Path(r"D:\Dropbox\Blender\projects\Atelyr\Uploads\\")
+HTTP_HOST = "0.0.0.0" # Listen on all interfaces
+HTTP_PORT = 8000
+
+# OBS Virtual Camera settings (similar to obs_bridge.py)
+# You might need to adjust obs_camera_device_idx_str based on your system. "0", "1", etc.
+# Or rely on finding it by name if supported by MediaPlayer on your platform.
+obs_camera_device_idx_str = "0"
+obs_capture_options = {
+    "framerate": "30",
+    "video_size": "1280x720", # Should match OBS Virtual Cam output
+    "pixel_format": "yuyv422", # Common for OBS Virtual Cam on Windows
+    # FFmpeg/dshow buffer tuning to prevent overflows
+    "rtbufsize": "150000k",    # Smaller real-time buffer (was 702000k)
+    "drop_pkts_on_overflow": "1", # Drop packets if we can't keep up
+    "fflags": "+nobuffer",     # Minimize buffering
+    "flags": "low_delay",      # Prioritize low latency
+    #"thread_queue_size": "64",  # stop FFmpeg creating its own big queue
+    #"probesize": "32",          # FFmpeg stops probing sooner
+}
+
+
+# WebRTC Configuration (e.g., STUN servers)
+# Add your STUN/TURN server details here if needed for NAT traversal
+RTC_CONFIGURATION = RTCConfiguration(iceServers=[
+    RTCIceServer("stun:stun.l.google.com:19302"),
+    # Example TURN server (replace with your own if you have one)
+    # RTCIceServer(
+    #     urls="turn:your.turn.server:3478",
+    #     username="your_username",
+    #     credential="your_password"
+    # )
+])
+
+# Global state for WebRTC
+pcs = set()
+relay = None # For video track from OBS
+webcam = None # MediaPlayer instance for OBS
+
+# -----------------------------------------------------------------------------
+# Logging Setup (Blender's console and stdout)
+# -----------------------------------------------------------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(levelname)-8s %(asctime)s %(message)s",
+    force=True          # <-- re-initialises the root logger
+)
+
+# Quiet verbose sub-loggers that can flood the console.
+for noisy in (
+    "aiortc",
+    "aiortc.rtcrtpsender",
+    "aiortc.rtcrtpreceiver",
+    "aiortc.contrib.media",
+    "aioice",
+):
+    logging.getLogger(noisy).setLevel(logging.INFO)
+
+# Ensure root logger itself is not in DEBUG (Blender may change it elsewhere).
+logging.getLogger().setLevel(logging.INFO)
+
+# -----------------------------------------------------------------------------
+# Blender Scene Setup Functions (from blender_setup.py)
+# -----------------------------------------------------------------------------
+def clear_startup_scene():
+    bpy.ops.object.select_all(action="SELECT")
+    bpy.ops.object.delete(use_global=False)
+    logging.info("Cleared default startup scene.")
+
+def import_glb(filepath: pathlib.Path):
+    if not filepath.exists():
+        logging.error(f"GLB not found: {filepath}")
+        # Don't sys.exit here, allow Blender to continue running, maybe with an empty scene
+        return False
+    logging.info(f"Importing GLB: {filepath} …")
+    try:
+        bpy.ops.import_scene.gltf(filepath=str(filepath))
+        logging.info("GLB imported successfully.")
+        return True
+    except Exception as e:
+        logging.error(f"Error importing GLB: {e}")
+        return False
+
+def set_cycles_renderer():
+    logging.info("Setting render engine to Cycles.")
+    scene = bpy.context.scene
+    scene.render.engine = 'CYCLES'
+
+    scene.render.engine = 'CYCLES' # Get from profile, default to CYCLES if missing
+    scene.cycles.device = 'GPU'
+
+    # Handle compute device setup (needs special care)
+    compute_device_type = 'OPTIX'
+    try:
+        preferences = bpy.context.preferences
+        system = preferences.addons['cycles'].preferences
+        if system.compute_device_type != compute_device_type:
+                system.compute_device_type = compute_device_type
+                system.get_devices() # Refresh devices after changing type
+                print(f"Compute Device Type set to: {system.compute_device_type}", flush=True)
+                for device in system.devices:
+                    # Enable devices matching the profile's compute type
+                    device.use = (device.type == compute_device_type)
+                    if device.use:
+                        print(f"Enabling {compute_device_type} device: {device.name}", flush=True)
+                # bpy.ops.wm.save_userpref() # Optional: Persist preference change
+        else:
+                # Ensure correct devices are enabled even if type hasn't changed
+                system.get_devices()
+                print(f"Compute Device Type already set to: {system.compute_device_type}", flush=True)
+                for device in system.devices:
+                    device.use = (device.type == compute_device_type)
+                    if device.use:
+                        print(f"Ensuring {compute_device_type} device is enabled: {device.name}", flush=True)
+
+    except Exception as e:
+            print(f"Warning: Could not configure {compute_device_type} devices: {e}", flush=True)
+
+
+def ensure_camera():
+    cams = [obj for obj in bpy.data.objects if obj.type == 'CAMERA']
+    if cams:
+        bpy.context.scene.camera = cams[0]
+        logging.info(f"Using existing camera: {cams[0].name}")
+        return cams[0]
+    logging.info("No camera found, creating a new one.")
+    bpy.ops.object.camera_add(align='VIEW', enter_editmode=False, location=(0, 0, 1.7))
+    cam = bpy.context.active_object
+    cam.rotation_euler = (0, 0, 0)  # Point camera forward (along +Y axis)
+    cam.data.lens = 35
+    bpy.context.scene.camera = cam
+    return cam
+
+
+def ensure_lighting():
+    # check if there is already a sun light in the scene
+    sun_light = [obj for obj in bpy.data.objects if obj.type == 'LIGHT' and obj.data.type == 'SUN']
+    if sun_light:
+        logging.info("Using existing sun light.")
+        return sun_light[0]
+    logging.info("No sun light found, creating a new one.")
+    bpy.ops.object.light_add(type='SUN', location=(0, 0, 0))
+    bpy.context.active_object.name = "Sun"
+    return bpy.context.active_object
+
+
+def set_viewport_shading_rendered():
+    logging.info("Setting viewport shading to RENDERED for all 3D views.")
+    for window in bpy.context.window_manager.windows:
+        for area in window.screen.areas:
+            if area.type == 'VIEW_3D':
+                for space in area.spaces:
+                    if space.type == 'VIEW_3D':
+                        space.shading.type = 'RENDERED'
+                        logging.info(f"Viewport shading set for area in window.") # Removed window.xid for simplicity/portability
+
+def maximise_3d_viewport():
+    """Toggle the first VIEW_3D area into full-screen, hiding UI panels.
+
+    This gives a clean full-screen viewport presentation for remote viewing.
+    If no VIEW_3D area is found (highly unlikely in the default screens), the
+    function quietly returns.
+    """
+
+    for window in bpy.context.window_manager.windows:
+        for area in window.screen.areas:
+            if area.type != 'VIEW_3D':
+                continue
+
+            # If this area is already full-screen, skip to avoid toggling back.
+            if area.ui_type == 'VIEW_3D' and window.screen.show_fullscreen:
+                logging.info("3D viewport already maximised – skipping toggle.")
+                return
+
+            # Find a region of type WINDOW to satisfy operator context.
+            region_win = next((r for r in area.regions if r.type == 'WINDOW'), None)
+            try:
+                override_kwargs = {"window": window, "area": area}
+                if region_win:
+                    override_kwargs["region"] = region_win
+                with bpy.context.temp_override(**override_kwargs):
+                    bpy.ops.screen.screen_full_area(use_hide_panels=True)
+                    logging.info("Maximised 3D viewport to full-screen area.")
+            except Exception as exc:
+                logging.warning("Could not maximise 3D viewport: %s", exc)
+            # Only attempt once.
+            return
+
+# ------------------------------------------------------------------
+# Helper: switch viewport to the active camera and frame it nicely
+# ------------------------------------------------------------------
+
+def set_camera_view_and_frame():
+    """Emulate NumPad 0 then Home to frame the active camera.
+
+    After loading a scene we want the 3D View to look straight through the
+    active camera with the frame fitting snugly inside the editor so remote
+    viewers immediately see the final composition.  The logic below adapts
+    Blender's internal Home-key behaviour for camera view by tweaking
+    `view_camera_zoom`.
+    """
+
+    for window in bpy.context.window_manager.windows:
+        for area in window.screen.areas:
+            if area.type != 'VIEW_3D':
+                continue
+
+            try:
+                space_data = area.spaces.active
+                # Ensure we are in camera perspective first.
+                space_data.region_3d.view_perspective = 'CAMERA'
+
+                cam = bpy.context.scene.camera
+                if cam is None:
+                    logging.info("set_camera_view_and_frame: No active camera; aborting.")
+                    return
+
+                render = bpy.context.scene.render
+                cam_width, cam_height = render.resolution_x, render.resolution_y
+                viewport_width, viewport_height = area.width, area.height
+
+                # Protect against division by zero in rare cases (minimised area)
+                try:
+                    cam_aspect = cam_width / cam_height
+                    viewport_aspect = viewport_width / viewport_height
+                except ZeroDivisionError:
+                    logging.warning("set_camera_view_and_frame: zero-sized viewport – skipping.")
+                    return
+
+                if viewport_aspect > cam_aspect:
+                    zoom_factor = int((viewport_height / cam_height) * 20) - 40
+                else:
+                    zoom_factor = int((viewport_width / cam_width) * 20) - 40
+
+                # Clamp Blender's allowed range (-30 .. 30 where negative zooms in)
+                zoom_factor = max(-30, min(zoom_factor, 30))
+
+                space_data.region_3d.view_camera_zoom = -zoom_factor
+                space_data.region_3d.view_camera_offset = (0.0, 0.0)
+
+                logging.info(f"Viewport switched to CAMERA view and framed (zoom { -zoom_factor }).")
+            except Exception as exc:
+                logging.warning("set_camera_view_and_frame failed: %s", exc)
+            # Only operate on the first VIEW_3D area we find.
+            return
+    logging.info("set_camera_view_and_frame: No VIEW_3D area found.")
+
+def setup_blender_scene():
+    clear_startup_scene()
+    #import_glb(GLB_PATH)
+    set_cycles_renderer()
+    ensure_camera()
+    ensure_lighting()
+    set_viewport_shading_rendered()
+    bpy.context.view_layer.update() # Ensure all changes are flushed
+    maximise_3d_viewport()
+    
+    # Hide viewport overlays and gizmos for a clean view
+    for window in bpy.context.window_manager.windows:
+        for area in window.screen.areas:
+            print(f"Area type: {area.type}", flush=True)
+            if area.type == 'VIEW_3D':
+                # Get the overlay and gizmo settings for this 3D viewport
+                area.spaces[0].overlay.show_overlays = False
+                area.spaces[0].show_gizmo = False
+                # Hide all overlays (axis, grid, text, etc)
+                #overlay.show_overlays = False
+                # Hide the viewport text info
+                area.spaces[0].show_region_header = False
+    # After maximising the viewport, make sure it actually shows the active
+    # camera and is nicely framed so the remote stream mirrors Blender's final
+    # output accurately.
+    try:
+        set_camera_view_and_frame()
+    except Exception as exc:
+        logging.warning("Could not set camera view & frame: %s", exc)
+    logging.info("Blender scene setup complete.")
+
+# -----------------------------------------------------------------------------
+# Inline copy of `handle_command` from blender_socket_server.py so this script
+# is completely self-contained.  Only minor edits were made to remove socket
+# dependencies and to log via `logging` instead of `print`.
+# -----------------------------------------------------------------------------
+
+# Optional helpers from other local modules; if unavailable certain actions will
+# warn but still allow the function to exist.
+try:
+    from extract_connected_faces import extract_connected_faces  # type: ignore
+except Exception as _imp_exc:
+    logging.warning("Could not import extract_connected_faces: %s", _imp_exc)
+    extract_connected_faces = None  # type: ignore
+
+try:
+    from blender_webrtc_stream import handle_offer, stop_session  # type: ignore
+except Exception as _imp_exc:
+    logging.warning("Could not import blender_webrtc_stream helpers: %s", _imp_exc)
+    handle_offer = None  # type: ignore
+    stop_session = None  # type: ignore
+
+
+# --- Render Settings Profiles (verbatim copy of the original dict) ---
+RENDER_SETTINGS_PROFILES = {
+    'default': {
+        'engine': 'CYCLES',
+        'device': 'GPU',
+        'compute_device_type': 'OPTIX',
+        'samples': 24,
+        'use_adaptive_sampling': True,
+        'adaptive_min_samples': 0,
+        'adaptive_threshold': 0.075,
+        'use_denoising': True,
+        'denoiser': 'OPTIX',
+        'use_persistent_data': True,
+        'max_bounces': 4,
+        'diffuse_bounces': 3,
+        'glossy_bounces': 3,
+        'transmission_bounces': 4,
+        'transparent_max_bounces': 4,
+        'caustics_reflective': True,
+        'caustics_refractive': True,
+        'use_simplify': True,
+        'simplify_subdivision_render': 0,
+        'simplify_subdivision': 0,
+    },
+    'high_quality': {
+        'engine': 'CYCLES',
+        'device': 'GPU',
+        'compute_device_type': 'OPTIX',
+        'samples': 512,
+        'use_adaptive_sampling': True,
+        'adaptive_min_samples': 0,
+        'adaptive_threshold': 0.01,
+        'use_denoising': True,
+        'denoiser': 'OPTIX',
+        'use_persistent_data': True,
+        'max_bounces': 12,
+        'diffuse_bounces': 8,
+        'glossy_bounces': 8,
+        'transmission_bounces': 12,
+        'transparent_max_bounces': 12,
+        'caustics_reflective': True,
+        'caustics_refractive': True,
+        'use_simplify': False,
+        'simplify_subdivision_render': 2,
+        'simplify_subdivision': 1,
+    },
+}
+
+# Store references to objects created via handle_command so they can be updated
+object_dict = {}
+
+
+def find_object_by_name(obj_name: str):
+    """Robust helper to locate an object by name even when Blender appends
+    numerical suffixes."""
+
+    target_obj = bpy.data.objects.get(obj_name)
+    if target_obj:
+        return target_obj
+
+    # Try to match name001-like patterns.
+    import re as _re
+    match = _re.search(r'([^.\d]+)(\d+)$', obj_name)
+    if match:
+        amended_name = f"{match.group(1)}.{match.group(2)}"
+        return bpy.data.objects.get(amended_name)
+
+    # Try removing underscore suffixes (foo_1 → foo)
+    match = _re.search(r'(.+)_\d+$', obj_name)
+    if match:
+        return bpy.data.objects.get(match.group(1))
+
+    return None
+
+
+# ------------------------------------------------------------------
+# Main command dispatcher – simplified copy of original.  Non-essential
+# actions were trimmed; extend as needed.
+# ------------------------------------------------------------------
+
+
+def handle_command(command: str):
+    """Parse a JSON string from the data channel and perform actions in Blender.
+
+    The implementation is a condensed subset of the original
+    blender_socket_server.handle_command to keep this script self-contained.  It
+    covers the most commonly used features; less frequently used actions can
+    be ported across later if required.
+    """
+
+    try:
+        data = json.loads(command)
+
+        action = data.get('action')
+        if not action:
+            return json.dumps({'error': 'no action provided'})
+
+
+        if action == 'move_object':
+            obj = bpy.data.objects.get(data.get('object', ''))
+            if obj:
+                obj.location = data.get('location', obj.location)
+                return 'object moved'
+            return json.dumps({'error': 'object not found'})
+
+        # --------------------------------------
+        # Camera tweaks (legacy – you may prefer the live update_camera action)
+        # --------------------------------------
+        # if action == 'update_camera':
+        #     cam = bpy.context.scene.camera or ensure_camera()
+        #     if 'focal_length' in data:
+        #         cam.data.lens = data['focal_length']
+        #     return 'camera updated'
+
+        # --------------------------------------
+        # Loading external GLB files
+        # --------------------------------------
+        if action == 'load_glb':
+            filepath = data.get('file_path')
+            if not filepath:
+                return json.dumps({'error': 'filepath missing'})
+
+            try:
+                model_path = GLB_MODEL_PATH / filepath
+                model_path_str = str(model_path)
+                
+                clear_startup_scene()
+                ensure_camera()
+                ensure_lighting()
+                set_camera_view_and_frame()
+
+                bpy.ops.import_scene.gltf(filepath=model_path_str)
+                bpy.context.view_layer.update()
+
+                # Deselect all objects after GLB import
+                bpy.ops.object.select_all(action='DESELECT')
+                return 'glb loaded'
+            except Exception as exc:
+                logging.warning('Error loading glb: %s', exc)
+                return json.dumps({'error': str(exc)})
+            
+            
+        if action == 'add_glb':
+            filepath = data.get('file_path')
+            object_id = data.get('object_id')
+            if filepath:
+                # Compose the absolute path to the requested GLB and convert
+                # it to a regular string because the import operator does not
+                # understand pathlib.Path instances ("WindowsPath" type).
+                model_path = GLB_MODEL_PATH / filepath
+                model_path_str = str(model_path)
+
+                if not model_path.exists():
+                    logging.error(f"GLB file not found: {model_path_str}")
+                    return json.dumps({'error': 'GLB file not found'})
+
+                # Import GLB file
+                bpy.ops.import_scene.gltf(filepath=model_path_str)
+                
+                # Get position and rotation from the request
+                position = data.get('position', (0, 0, 0))
+                rotation = data.get('rotation', (0, 0, 0))
+                
+                # Find the first non-empty object or object with multiple children
+                obj = None
+                print(f"Number of selected objects after import: {len(bpy.context.selected_objects)}", flush=True)
+                for root_obj in bpy.context.selected_objects:
+                    if root_obj.parent is None:
+                        obj = root_obj
+                        while len(obj.children) == 1:
+                            obj = obj.children[0]
+                        break
+                
+                if obj:
+                    # Apply position and rotation
+                    obj.location = position
+                    obj.rotation_euler = rotation
+                    
+                    # Store the object reference in the dictionary
+                    object_dict[object_id] = obj
+                    obj.name = object_id
+                    
+                    # Update the scene
+                    bpy.context.view_layer.update()
+                    
+                    print(f"Added object to the scene from {filepath} with object_id: {object_id}. position: {obj.location}, rotation: {obj.rotation_euler}", flush=True)
+                    return f"{object_id}:GLB file added successfully to the current scene with specified transformations"
+                else:
+                    print("No suitable object found in the imported GLB file", flush=True)
+                    return "Error: No suitable object found in the imported GLB file"
+            else:
+                print(f"No filepath provided for GLB file: {filepath}", flush=True)
+                return "Error: No filepath provided for GLB file"
+            
+        if action == 'modify_object':
+            object_id = data.get('object_id')
+            if object_id:
+                # Retrieve the object from the dictionary
+                obj = object_dict.get(object_id)
+                if obj:
+                    # Apply modifications (e.g., change position)
+                    new_position = data.get('position')
+                    if new_position:
+                        obj.location = new_position
+                    new_rotation = data.get('rotation')
+                    if new_rotation:
+                        # Seems you have to set the rotation mode to 'XYZ' before setting the rotation
+                        previous_mode = obj.rotation_mode
+                        obj.rotation_mode = 'XYZ'
+                        obj.rotation_euler = new_rotation
+                        obj.rotation_mode = previous_mode
+                    # Add more modifications as needed
+                    bpy.context.view_layer.update()
+
+                    print(f"Object {object_id} modified successfully. New position: {obj.location}, New rotation: {obj.rotation_euler}", flush=True)
+                    return f"Object {object_id} modified successfully"
+                else:
+                    print(f"Error: Object with id {object_id} not found", flush=True)
+                    return f"Error: Object with id {object_id} not found"
+            else:
+                print("Error: No object_id provided", flush=True)
+                return "Error: No object_id provided"
+
+        # --------------------------------------
+        # Retrieve an object's transform
+        # --------------------------------------
+        if action == 'get_object_state':
+            obj_name = data.get('object_id')
+            obj = bpy.data.objects.get(obj_name) if obj_name else None
+            if not obj:
+                return json.dumps({'error': 'object not found'})
+            return json.dumps({'position': list(obj.location), 'rotation': list(obj.rotation_euler)})
+
+        # --------------------------------------
+        # Delete object
+        # --------------------------------------
+        if action == 'delete_object':
+            obj_name = data.get('object_id')
+            obj = bpy.data.objects.get(obj_name) if obj_name else None
+            if obj:
+                bpy.data.objects.remove(obj, do_unlink=True)
+                return 'object deleted'
+            return json.dumps({'error': 'object not found'})
+
+        # --------------------------------------
+        # Update lighting
+        # --------------------------------------
+        if action == 'update_lighting':
+            # bpy.ops.object.light_add(type='POINT', location=(0, 0, 0))
+            # Get the sun light
+            # sun_light = [obj for obj in bpy.data.objects if obj.type == 'LIGHT' and obj.data.type == 'SUN'][0]
+            # Position it above and slightly behind the scene
+            sun_light = bpy.data.objects.get("Sun")
+            position_data = data.get('position')
+            rotation_data = data.get('rotation')
+            intensity_data = data.get('intensity')
+            if position_data:
+                sun_light.location = (position_data.get('x', sun_light.location.x),
+                                    position_data.get('y', sun_light.location.y),
+                                    position_data.get('z', sun_light.location.z))
+                logging.info(f"Updated sun light position to: {sun_light.location}")
+
+            if rotation_data:
+                sun_light.rotation_euler = (rotation_data.get('x', sun_light.rotation_euler.x),
+                                          rotation_data.get('y', sun_light.rotation_euler.y),
+                                          rotation_data.get('z', sun_light.rotation_euler.z))
+                logging.info(f"Updated sun light rotation to: {sun_light.rotation_euler}")
+
+            if intensity_data is not None: # Check for None explicitly, as 0 is a valid intensity
+                sun_light.data.energy = float(intensity_data)
+                logging.info(f"Updated sun light intensity to: {sun_light.data.energy}")
+
+            return json.dumps({'status': 'lighting updated', 'object_id': sun_light.name})
+        
+
+
+        if action == 'update_mesh':
+            print("update_mesh action received", flush=True)
+            object_id = data.get('object_id')
+            obj = object_dict.get(object_id)
+            if not obj:
+                obj = bpy.data.objects.get(object_id)
+
+            if obj:
+                # Remove object from scene and dictionary
+                bpy.data.objects.remove(obj, do_unlink=True)
+                if object_id in object_dict:
+                    del object_dict[object_id]
+                print(f"update_mesh: Removed existing object {object_id} and recreating", flush=True)
+            else:
+                print("update_mesh: New object being created", flush=True)
+                # Get base64 encoded GLB data
+            glb_base64 = data.get('glb')
+            if not glb_base64:
+                return "Error: No GLB data provided"
+
+            try:
+                # Decode base64 data
+                glb_data = base64.b64decode(glb_base64)
+                print(f"Decoded GLB data size: {len(glb_data)} bytes", flush=True)
+                
+                # Create temporary file
+                temp_path = os.path.join(bpy.app.tempdir, f"temp_glb_{uuid.uuid4()}.glb")
+                with open(temp_path, 'wb') as f:
+                    f.write(glb_data)
+
+                # Import GLB file
+                bpy.ops.import_scene.gltf(filepath=temp_path)
+                
+                # Get the imported object
+                imported_obj = None
+                for root_obj in bpy.context.selected_objects:
+                    if root_obj.parent is None:
+                        imported_obj = root_obj
+                        while len(imported_obj.children) == 1:
+                            imported_obj = imported_obj.children[0]
+                        break
+
+                if not imported_obj:
+                    print("Error: No suitable object found in imported GLB", flush=True)
+                    return "Error: No suitable object found in imported GLB"
+
+                # Set object name and store in dictionary
+                imported_obj.name = object_id
+                object_dict[object_id] = imported_obj
+                # Count materials on imported object
+                material_count = len(imported_obj.material_slots)
+                print(f"1. Object {object_id} has {material_count} materials", flush=True)
+
+                # Handle parent-child relationship
+                parent_object_id = data.get('parent_object_id')
+                if parent_object_id:
+                    parent_obj = find_object_by_name(parent_object_id)
+                    if parent_obj:
+                        imported_obj.parent = parent_obj
+                        print(f"Set parent of {object_id} to {parent_object_id}", flush=True)
+                    else:
+                        print(f"Error: Parent object with id {parent_object_id} not found", flush=True)
+                        return f"Error: Parent object with id {parent_object_id} not found"
+
+                material_count = len(imported_obj.material_slots)
+                print(f"2. Object {object_id} has {material_count} materials", flush=True) 
+
+                # Apply position and rotation
+                position = data.get('position', (0, 0, 0))
+                rotation = data.get('rotation', (0, 0, 0))
+                
+                imported_obj.location = position
+                previous_mode = imported_obj.rotation_mode
+                imported_obj.rotation_mode = 'XYZ'
+                imported_obj.rotation_euler = rotation
+                imported_obj.rotation_mode = previous_mode
+
+                # Clean up temporary file
+                os.remove(temp_path)
+
+                # Update the scene
+                bpy.context.view_layer.update()
+
+                material_count = len(imported_obj.material_slots)
+                print(f"3. Object {object_id} has {material_count} materials", flush=True)
+                
+                print(f"Successfully imported and positioned object {object_id}", flush=True)
+                return f"Object {object_id} created and positioned successfully"
+
+            except Exception as e:
+                error_message = f"Error in update_mesh: {str(e)}"
+                print(error_message, flush=True)
+                print("Stack trace:", flush=True)
+                traceback.print_exc()
+                return error_message
+        
+        
+        # --------------------------------------
+        # Fallback – echo action not supported
+        # --------------------------------------
+        return json.dumps({'error': f'unrecognised action "{action}"'})
+    
+       
+
+    except Exception as exc:
+        logging.exception('handle_command error: %s', exc)
+        return json.dumps({'error': str(exc)})
+
+
+_HAS_HANDLE_COMMAND = True
+
+# -----------------------------------------------------------------------------
+# WebRTC Server Functions (adapted from obs_bridge.py and aiortc examples)
+# -----------------------------------------------------------------------------
+
+def _cors_headers():
+    return {
+        "Access-Control-Allow-Origin": "*", # Adjust for security in production
+        "Access-Control-Allow-Methods": "POST, OPTIONS, GET",
+        "Access-Control-Allow-Headers": "Content-Type",
+    }
+
+# -----------------------------------------------------------------------------
+# Global flag used to ensure we switch viewports to camera only once.
+# Must be defined before any asynchronous callbacks may reference it.
+# -----------------------------------------------------------------------------
+
+_CAM_VIEW_LOCKED = False
+
+# Helper to switch all 3D Viewports to the active scene camera once so the
+# remote viewer actually looks through the synchronised camera.
+
+def lock_viewports_to_camera() -> None:
+    """Ensure each VIEW_3D editor is in camera view."""
+
+    scene_cam = bpy.context.scene.camera
+    if scene_cam is None:
+        return
+
+    for window in bpy.context.window_manager.windows:
+        for area in window.screen.areas:
+            if area.type != 'VIEW_3D':
+                continue
+            try:
+                region_win = next((r for r in area.regions if r.type == 'WINDOW'), None)
+                override_kwargs = {"window": window, "area": area}
+                if region_win:
+                    override_kwargs["region"] = region_win
+                with bpy.context.temp_override(**override_kwargs):
+                    bpy.ops.view3d.view_camera()
+            except Exception:
+                pass
+
+async def webrtc_offer_handler(request):
+    if not RTCPeerConnection: # Check if aiortc loaded
+        return web.Response(
+            content_type="application/json",
+            text=json.dumps({"error": "aiortc library not available in Blender's Python environment."}),
+            status=500, headers=_cors_headers()
+        )
+
+    params = await request.json()
+    offer = RTCSessionDescription(sdp=params["sdp"], type=params["type"])
+
+    pc = RTCPeerConnection(configuration=RTC_CONFIGURATION)
+    pcs.add(pc)
+    pc_id = hex(id(pc))  # unique identifier for logging
+    logging.info(f"PeerConnection created {pc_id}, total pcs: {len(pcs)}")
+
+    # --- Data Channel Setup ---
+    # Example: A data channel named 'commands'
+    # The client will also need to create a data channel with the same name.
+    def _attach_handlers_to_channel(channel):
+        """Registers open / message / close / error handlers on a given datachannel."""
+
+        @channel.on("open")
+        def on_datachannel_open():
+            logging.info(f"Data channel '{channel.label}' on PC {pc_id} opened.")
+
+        @channel.on("message")
+        def on_datachannel_message(message):
+            # Only log non-camera update messages
+            if not (isinstance(json.loads(message), dict) and json.loads(message).get("action") == "update_camera"):
+                logging.info(f"Data channel 'commands' on PC {pc_id} received message (truncated): {message[:128]}…")
+
+            # Decode JSON message.
+            try:
+                msg = json.loads(message)
+            except json.JSONDecodeError:
+                logging.warning(f"PC {pc_id} received non-JSON message – ignored: {message}")
+                return
+
+            # --------------------------------------------------------------
+            # Special-case: live camera synchronisation from three.js
+            # --------------------------------------------------------------
+            if isinstance(msg, dict) and msg.get("action") == "update_camera":
+
+                def _apply_camera_update(_lock=lock_viewports_to_camera):
+                    """Apply camera transform & projection coming from three.js."""
+                    try:
+                        cam = bpy.context.scene.camera or ensure_camera()
+
+                        # Location & rotation
+                        if "position" in msg:
+                            cam.location = msg["position"]
+                        if "rotation" in msg:
+                            cam.rotation_euler = msg["rotation"]  # already in radians XYZ
+
+                        # Projection/FOV settings (assume horizontal FOV in degrees)
+                        cam.data.type = 'PERSP'
+                        cam.data.lens_unit = 'FOV'
+                        if "fov" in msg:
+                            cam.data.angle = math.radians(msg["fov"])
+
+                        # Sensor fit so FOV is horizontal in Blender (matches three.js)
+                        cam.data.sensor_fit = 'HORIZONTAL'
+
+                        # Clipping planes
+                        if "near" in msg:
+                            cam.data.clip_start = msg["near"]
+                        if "far" in msg:
+                            cam.data.clip_end = msg["far"]
+                            
+                        # Set render resolution to match client canvas
+                        if "width" in msg and "height" in msg:
+                            bpy.context.scene.render.resolution_x = msg["width"]
+                            bpy.context.scene.render.resolution_y = msg["height"]
+                            bpy.context.scene.render.resolution_percentage = 100
+
+                            # Resize window using the operator
+                            # try:
+                            #     bpy.ops.wm.window_geometry(x=0, y=0, width=msg["width"], height=msg["height"])
+                            # except Exception as window_exc:
+                            #     logging.warning(f"Could not resize window: {window_exc}")
+                                
+                        # Force scene update so viewport redraws immediately.
+                        bpy.context.view_layer.update()
+
+
+                    except Exception as exc:
+                        logging.exception("Failed to apply camera update from WebRTC: %s", exc)
+                    return None  # Run once
+
+                # Schedule on Blender's main thread – don't block asyncio callback.
+                bpy.app.timers.register(_apply_camera_update)
+
+                #logging.info("Applied update_camera message (position=%s, fov=%s)", msg.get("position"), msg.get("fov"))
+
+                # Optionally, acknowledge receipt (empty JSON).
+                try:
+                    channel.send("{}")
+                except Exception:
+                    pass
+                return  # Handled – nothing further.
+
+            # --------------------------------------------------------------
+            # Fallback: existing JSON command system via handle_command
+            # --------------------------------------------------------------
+            if not _HAS_HANDLE_COMMAND:
+                logging.debug("handle_command not available – ignoring non-camera message.")
+                return
+
+            # Heavy work delegated to existing command handler.
+            result_container = {"done": False, "result": ""}
+
+            def _execute_command_and_respond():
+                try:
+                    response = handle_command(message)
+                except Exception as exc:
+                    response = json.dumps({"error": str(exc)})
+
+                # send the response AFTER the command finished,
+                # but without blocking the event-loop.
+                try:
+                    channel.send(response or "{}")
+                except Exception as e_send:
+                    logging.error("Failed to send response over data channel: %s", e_send)
+                return None                 # timers must return None
+
+            bpy.app.timers.register(_execute_command_and_respond)
+
+            # If that command was a successful GLB load, ask the browser
+            # for its current camera so we can sync immediately.
+            try:
+                if isinstance(message, str):
+                    msg_dict = json.loads(message)
+                    if (msg_dict.get("action") == "load_glb" and
+                        not response.startswith('{"error"')):
+                        channel.send(json.dumps({ "action": "request_camera_state" }))
+            except Exception:
+                pass
+
+        @channel.on("close")
+        def on_datachannel_close():
+            logging.info(f"Data channel '{channel.label}' on PC {pc_id} closed.")
+
+        @channel.on("error")
+        def on_datachannel_error(error):
+            logging.error(f"Data channel '{channel.label}' on PC {pc_id} error: {error}")
+
+    # ------------------------------------------------------------------
+    # For an answering peer (we are the server, client sent OFFER) we wait
+    # for the remote side to create the data channel first and just hook
+    # onto it here.  If no channel is created by the client we could fall
+    # back to creating one after the handshake, but the typical web-RTC
+    # usage is for the offerer (browser) to create it.
+    # ------------------------------------------------------------------
+
+    @pc.on("datachannel")
+    def on_datachannel(channel):
+        #logging.info(f"Received data channel '{channel.label}' from remote peer on PC {pc_id}.")
+        if channel.label == "commands":
+            _attach_handlers_to_channel(channel)
+
+    # Do NOT create a second data channel from the answering side – we rely on
+    # the offerer (browser) to create it.  Creating another channel with the
+    # same label can lead to confusion about which one carries commands.
+
+    @pc.on("connectionstatechange")
+    async def on_connectionstatechange():
+        logging.info(f"PC {pc_id} connection state: {pc.connectionState}")
+        # ------------------------------------------------------------------
+        # In some older aiortc builds (or distro-patched variants shipping with
+        # certain Blender releases) the RTCPeerConnection does not expose the
+        # "dataChannels" CamelCase property found in upstream aiortc.  Instead
+        # there may be a snake_case "data_channels" attribute, or none at all.
+        # Attempt to log the active channels defensively so we never raise
+        # AttributeError in the asyncio callback – such uncaught errors bubble
+        # up through pyee and pollute the console.
+        # ------------------------------------------------------------------
+        try:
+            if hasattr(pc, "dataChannels"):
+                _dc_labels = [c.label for c in pc.dataChannels]
+            elif hasattr(pc, "data_channels"):
+                _dc_labels = [c.label for c in pc.data_channels]
+            else:
+                _dc_labels = []
+            logging.info(f"PC {pc_id} current data channels: {_dc_labels}")
+        except Exception as _log_exc:
+            # Never let logging itself kill the coroutine – just record a stub.
+            logging.debug(
+                "Could not list data channels for PC %s (error: %s)", pc_id, _log_exc
+            )
+        if pc.connectionState == "failed" or pc.connectionState == "closed":
+            await pc.close()
+            pcs.discard(pc)
+            logging.info(f"PC {pc_id} closed and removed, total pcs: {len(pcs)}")
+
+    # --- Video Track Setup (from OBS Virtual Camera) ---
+    global relay, webcam
+    if MediaPlayer is None or MediaRelay is None:
+        logging.error("MediaPlayer or MediaRelay not available. Cannot stream video.")
+    elif webcam is None: # Initialize webcam once
+        logging.info(f"Attempting to access OBS Virtual Camera at index: '{obs_camera_device_idx_str}' with options: {obs_capture_options}")
+        # Try by name first if "OBS Virtual Camera" is universally recognized
+        # This depends on the aiortc MediaPlayer backend for your OS.
+        # Fallback to index if named access fails or is not desired.
+        obs_device_string = f"video=OBS Virtual Camera" # Common name
+        
+        current_platform = platform.system()
+        media_format = "dshow" if current_platform == "Windows" else None # dshow for Windows, None for others (auto)
+
+        # Attempt to open by name
+        webcam_by_name = MediaPlayer(obs_device_string, format=media_format, options=obs_capture_options)
+        if webcam_by_name and webcam_by_name.video:
+            webcam = webcam_by_name
+            logging.info(f"Successfully opened OBS Virtual Camera by name: '{obs_device_string}'")
+        else:
+            logging.warning(f"Could not open OBS Virtual Camera by name ('{obs_device_string}'), trying index '{obs_camera_device_idx_str}'")
+            if webcam_by_name: webcam_by_name.video.stop() # Clean up previous attempt
+
+            webcam_by_index = MediaPlayer(obs_camera_device_idx_str, format=media_format, options=obs_capture_options)
+            if webcam_by_index and webcam_by_index.video:
+                webcam = webcam_by_index
+                logging.info(f"Successfully opened OBS Virtual Camera by index: '{obs_camera_device_idx_str}'")
+            else:
+                logging.error(f"Failed to open OBS Virtual Camera by name or index. Ensure OBS is running and Virtual Cam is active.")
+                if webcam_by_index and webcam_by_index.video: webcam_by_index.video.stop()
+                # No video source, handle error
+                return web.Response(
+                    content_type="application/json",
+                    text=json.dumps({"error": "Could not access OBS Virtual Camera on server."}),
+                    status=500, headers=_cors_headers()
+                )
+        
+        if relay is None: # Initialize relay once
+             relay = MediaRelay()
+
+    if webcam and webcam.video and relay:
+        try:
+            # Add video track with explicit transceiver direction
+            transceiver = pc.addTransceiver(relay.subscribe(webcam.video), direction="sendonly")
+            logging.info(f"Video track from OBS Virtual Cam added to PC {pc_id}")
+        except Exception as e_track:
+            logging.error(f"Error adding video track to PC {pc_id}: {e_track}")
+            # Potentially close PC or return error
+    else:
+        logging.warning(f"No webcam video track or relay available to add to PC {pc_id}. Proceeding without video for this peer.")
+
+
+    await pc.setRemoteDescription(offer)
+    logging.info(f"PC {pc_id}: Offer set as remote description")
+
+    answer = await pc.createAnswer()
+    await pc.setLocalDescription(answer)
+    logging.info(f"PC {pc_id}: Answer created and set as local description")
+
+    return web.Response(
+        content_type="application/json",
+        text=json.dumps(
+            {"sdp": pc.localDescription.sdp, "type": pc.localDescription.type}
+        ),
+        headers=_cors_headers(),
+    )
+    
+async def webrtc_offer_handler_glb(request):
+    if request.content_type != "application/octet-stream":
+        return web.Response(
+            status=400,
+            text="Expected application/octet-stream content type",
+            headers=_cors_headers()
+        )
+    
+    # Ensure uploads directory exists
+    os.makedirs(GLB_MODEL_UPLOAD_PATH, exist_ok=True)
+    
+    # Generate unique filename with timestamp
+    filename = f"model_{int(time.time())}.glb"
+    filepath = os.path.join(GLB_MODEL_UPLOAD_PATH, filename)
+    
+    try:
+        # Read the entire request body as bytes
+        data = await request.read()
+        
+        # Write to file asynchronously using aiofiles
+        async with aiofiles.open(filepath, 'wb') as f:
+            await f.write(data)
+        
+        # Schedule GLB import on Blender's main thread
+        def _import_glb_on_main():
+            try:
+                bpy.ops.import_scene.gltf(filepath=filepath)
+                logging.info("Imported GLB %s", filepath)
+            except Exception as exc:
+                logging.error("Failed to import %s: %s", filepath, exc)
+            return None            # Remove the timer after first run
+
+        bpy.app.timers.register(_import_glb_on_main)
+        # ----------------------------------------------------------
+
+        return web.json_response({"status": "scheduled", "filename": filename}, headers=_cors_headers())
+            
+    except Exception as e:
+        logging.error(f"Error handling GLB upload: {e}")
+        return web.json_response({
+            "status": "error", 
+            "message": str(e)
+        }, status=500, headers=_cors_headers())
+
+async def on_aiohttp_shutdown(app):
+    logging.info("Shutting down WebRTC peer connections...")
+    coros = [pc.close() for pc in pcs]
+    await asyncio.gather(*coros)
+    pcs.clear()
+    logging.info("Peer connections closed.")
+    global webcam
+    if webcam and webcam.video:
+        # MediaPlayer's track usually stops itself on garbage collection or player stop
+        # but explicit stop can be good practice if MediaPlayer had a .stop() method for the whole player
+        logging.info("Stopping OBS Virtual Camera MediaPlayer video track...")
+        webcam.video.stop() # Stop the video track
+        webcam = None # Clear the global instance
+    logging.info("WebRTC server shutdown complete.")
+
+
+# Handler for OPTIONS requests (CORS pre-flight)
+async def options_handler(request: web.Request) -> web.Response:
+    return web.Response(status=204, headers=_cors_headers())
+
+# -----------------------------------------------------------------------------
+# Main Server Start and Blender Integration
+# -----------------------------------------------------------------------------
+_event_loop = None
+_server_thread = None
+_aiohttp_runner = None
+
+def run_server_in_thread():
+    global _event_loop, _aiohttp_runner
+    _event_loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(_event_loop)
+    # Allow large file uploads (e.g., 100MB for GLB files)
+    app = web.Application(client_max_size=100*1024*1024)  # 100MB
+    app.on_shutdown.append(on_aiohttp_shutdown)
+    # Setup routes
+    app.router.add_post("/webrtc_offer", webrtc_offer_handler)
+    app.router.add_post("/webrtc_offer_glb", webrtc_offer_handler_glb)
+    app.router.add_route("OPTIONS", "/webrtc_offer", options_handler) # For CORS pre-flight
+    app.router.add_route("OPTIONS", "/webrtc_offer_glb", options_handler) # For CORS pre-flight
+
+    # Add a simple health check endpoint
+    async def health_check(request):
+        return web.Response(text="Blender WebRTC server is running", headers=_cors_headers())
+    app.router.add_get("/health", health_check)
+
+    _aiohttp_runner = web.AppRunner(app)
+    _event_loop.run_until_complete(_aiohttp_runner.setup())
+    site = web.TCPSite(_aiohttp_runner, HTTP_HOST, HTTP_PORT)
+    _event_loop.run_until_complete(site.start())
+    logging.info(f"Blender WebRTC server started on http://{HTTP_HOST}:{HTTP_PORT}")
+    logging.info("Streaming OBS Virtual Camera feed and listening for commands.")
+    _event_loop.run_forever() # Keep the event loop running in this thread
+
+def stop_webrtc_server_threaded():
+    global _event_loop, _aiohttp_runner, _server_thread
+    if _event_loop and _aiohttp_runner:
+        logging.info("Attempting to stop WebRTC server thread...")
+        # Schedule cleanup and stop of the runner and loop
+        _event_loop.call_soon_threadsafe(_event_loop.create_task, _aiohttp_runner.cleanup())
+        _event_loop.call_soon_threadsafe(_event_loop.stop)
+        
+        if _server_thread and _server_thread.is_alive():
+            _server_thread.join(timeout=5.0) # Wait for thread to finish
+            if _server_thread.is_alive():
+                logging.warning("WebRTC server thread did not stop cleanly after 5s.")
+        _server_thread = None
+        _aiohttp_runner = None
+        _event_loop = None
+        logging.info("WebRTC server thread resources should be released.")
+    else:
+        logging.info("WebRTC server not running or already stopped.")
+
+
+# Store the handler so it can be removed if the script is re-run or Blender closes
+#_modal_timer = None
+
+class RunAsyncioInBlenderOperator(bpy.types.Operator):
+    bl_idname = "wm.run_asyncio_event_loop"
+    bl_label = "Run Asyncio Event Loop (WebRTC Server)"
+    
+    _timer = None
+    _thread_for_server = None # Keep reference to the thread
+
+    def modal(self, context, event):
+        if not self._thread_for_server or not self._thread_for_server.is_alive():
+            logging.info("WebRTC server thread stopped or not started. Operator finishing.")
+            self.cancel(context)
+            return {'FINISHED'}
+            
+        # This modal operator just keeps Blender responsive while the asyncio loop runs in its thread.
+        # It doesn't directly interact with the asyncio loop here.
+        # For actual bpy operations from asyncio, use bpy.app.timers.register.
+        return {'PASS_THROUGH'}
+
+    def execute(self, context):
+        if MediaPlayer is None or web is None or RTCPeerConnection is None :
+            self.report({'ERROR'}, "Missing critical libraries for WebRTC server. Cannot start.")
+            logging.error("Operator: Missing critical libraries for WebRTC server. Cannot start.")
+            return {'CANCELLED'}
+
+        # Setup Blender scene first
+        setup_blender_scene()
+
+        # Start the WebRTC server in a separate thread
+        if not self._thread_for_server or not self._thread_for_server.is_alive():
+            self._thread_for_server = threading.Thread(target=run_server_in_thread, name="BlenderWebRTCServerThread", daemon=True)
+            self._thread_for_server.start()
+            logging.info("Operator: WebRTC server thread started.")
+        else:
+            logging.info("Operator: WebRTC server thread already seems to be running.")
+
+        # Register a modal timer to keep Blender's UI responsive and to allow for cleanup
+        wm = context.window_manager
+        self._timer = wm.event_timer_add(0.5, window=context.window) # Check every 0.5 seconds
+        wm.modal_handler_add(self)
+        logging.info("Operator: Modal timer registered to keep Blender responsive.")
+        return {'RUNNING_MODAL'}
+
+    def cancel(self, context):
+        wm = context.window_manager
+        if self._timer:
+            wm.event_timer_remove(self._timer)
+            self._timer = None
+            logging.info("Operator: Modal timer removed.")
+        
+        # Attempt to stop the server thread cleanly
+        stop_webrtc_server_threaded() # Use the refactored stop function
+        self._thread_for_server = None # Clear reference
+        logging.info("Operator: Cancelled, WebRTC server shutdown initiated.")
+
+
+# For running directly with `blender --python script.py`
+if __name__ == "__main__":
+    # Check for essential modules that might not have loaded
+    if MediaPlayer is None or web is None or RTCPeerConnection is None:
+        logging.error("One or more critical libraries (cv2, aiortc, aiohttp) are not installed in Blender's Python environment.")
+        logging.error("Please install them to run the WebRTC server.")
+        sys.exit(1)  # Exit if critical libraries are missing
+    else:
+        # Register the operator to keep the server running
+        bpy.utils.register_class(RunAsyncioInBlenderOperator)
+        
+        # Start the server via the operator
+        bpy.ops.wm.run_asyncio_event_loop('INVOKE_DEFAULT')
+        
+        logging.info("Blender WebRTC server started via operator.")
+        logging.info("The server will keep running until Blender is closed or the operator is cancelled.")
+
+        # --------------------------------------------------------------
+        # Register a clean-up callback so the web-server is torn down
+        # when Blender exits (or when a new .blend is loaded, in newer
+        # builds that no longer expose a `quit_pre` handler list).
+        # --------------------------------------------------------------
+
+        def on_blender_exit(_: bpy.types.BlendData = None):  # signature for load_pre
+            """Ensure background thread and asyncio loop are shut down."""
+            logging.info("Blender exit (or file reload) detected – stopping WebRTC server …")
+            stop_webrtc_server_threaded()
+
+        # Newer Blender (≥4.3) dropped the `quit_pre` handler.  Register
+        # defensively so we work with both old and new versions.
+        handlers = bpy.app.handlers
+        if hasattr(handlers, "quit_pre"):
+            if on_blender_exit not in handlers.quit_pre:
+                handlers.quit_pre.append(on_blender_exit)
+                logging.debug("Registered on_blender_exit to handlers.quit_pre")
+        else:
+            # Fallback ‑ use load_pre which fires just before a new file is
+            # loaded or Blender quits – sufficiently early for clean-up.
+            if on_blender_exit not in handlers.load_pre:
+                handlers.load_pre.append(on_blender_exit)
+                logging.debug("Registered on_blender_exit to handlers.load_pre (fallback)")
+
+

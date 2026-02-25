@@ -29,7 +29,7 @@ export class ApiClient {
 
     const headers = new Headers(options.headers);
     if (this.token) {
-      headers.set("authorization", `Bearer ${this.token}`);
+      headers.set("cookie", `rs-auth=${this.token}`);
     }
     if (options.body && !headers.has("content-type")) {
       headers.set("content-type", "application/json");
