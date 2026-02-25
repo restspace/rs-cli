@@ -29,6 +29,18 @@ type SyncStats = {
   failed: number;
 };
 
+type SyncPlanSummary = {
+  local: {
+    add: number;
+    delete: number;
+  };
+  remote: {
+    add: number;
+    delete: number;
+  };
+  totalActions: number;
+};
+
 function resolveHost(host?: string): string {
   if (!host) {
     writeError({
@@ -414,6 +426,36 @@ function planActions(
   return { actions, stats };
 }
 
+function summarizePlan(actions: SyncAction[]): SyncPlanSummary {
+  const summary: SyncPlanSummary = {
+    local: {
+      add: 0,
+      delete: 0,
+    },
+    remote: {
+      add: 0,
+      delete: 0,
+    },
+    totalActions: actions.length,
+  };
+  for (const action of actions) {
+    if (action.type === "download") {
+      summary.local.add++;
+      continue;
+    }
+    if (action.type === "deleteLocal") {
+      summary.local.delete++;
+      continue;
+    }
+    if (action.type === "upload") {
+      summary.remote.add++;
+      continue;
+    }
+    summary.remote.delete++;
+  }
+  return summary;
+}
+
 async function executeAction(
   action: SyncAction,
   host: string,
@@ -495,10 +537,10 @@ async function writeSyncFile(rootPath: string, sitePath: string): Promise<void> 
 }
 
 export const SYNC_DESCRIPTION =
-  "Sync a local directory with a remote Restspace directory.";
+  "Sync a local directory with a remote Restspace directory (previews changes and asks for confirmation unless --yes is provided).";
 
 export async function runSync(
-  options: { local?: string; remote?: string },
+  options: { local?: string; remote?: string; yes?: boolean },
   path: string,
   siteRelativeUrl?: string,
 ): Promise<void> {
@@ -529,7 +571,6 @@ export async function runSync(
   const resolvedSitePath = normalizeSitePath(
     siteRelativeUrl?.trim() || storedSitePath || "",
   );
-  await writeSyncFile(localRoot, resolvedSitePath);
 
   const config = await loadConfig();
   const host = resolveHost(config.host);
@@ -546,6 +587,47 @@ export async function runSync(
     localMode,
     remoteMode,
   );
+  const planned = summarizePlan(actions);
+
+  writeSuccess({
+    preview: true,
+    path: localRoot,
+    siteRelativeUrl: resolvedSitePath,
+    modes: {
+      local: localMode ?? null,
+      remote: remoteMode ?? null,
+    },
+    planned,
+    analysis: {
+      localFiles: stats.localFiles,
+      remoteFiles: stats.remoteFiles,
+      noChange: stats.noChange,
+      ignored: stats.ignored,
+    },
+  });
+
+  if (actions.length > 0 && !options.yes) {
+    let approved = false;
+    try {
+      approved = confirm("Proceed with sync changes? [y/N]");
+    } catch {
+      writeError({
+        error: "Unable to read interactive confirmation.",
+        suggestion: "Run with -y or --yes to bypass confirmation.",
+      });
+    }
+    if (!approved) {
+      writeSuccess({
+        path: localRoot,
+        siteRelativeUrl: resolvedSitePath,
+        planned,
+        aborted: true,
+      });
+      return;
+    }
+  }
+
+  await writeSyncFile(localRoot, resolvedSitePath);
 
   const failures: Array<{ action: SyncActionType; path: string; error: string }> = [];
   for (const action of actions) {
@@ -594,9 +676,10 @@ export function syncCommand() {
     .arguments("<path:string> [siteRelativeUrl:string]")
     .option("--local <mode:string>", "Local mismatch behavior: add|delete")
     .option("--remote <mode:string>", "Remote mismatch behavior: add|delete")
+    .option("-y, --yes", "Bypass confirmation prompt")
     .action(async (options, path, siteRelativeUrl) => {
       await runSync(
-        options as { local?: string; remote?: string },
+        options as { local?: string; remote?: string; yes?: boolean },
         path,
         siteRelativeUrl,
       );
