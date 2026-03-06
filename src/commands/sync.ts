@@ -2,6 +2,7 @@ import { Command } from "cliffy/command/mod.ts";
 import { dirname, join, relative, resolve } from "std/path/mod.ts";
 import { loadConfig, normalizeHost } from "../lib/config-store.ts";
 import { writeError, writeSuccess } from "../lib/output.ts";
+import { requestRaw } from "../lib/raw-request.ts";
 
 const SYNC_FILE_NAME = ".rs-sync";
 const SYNC_STATE_FILE_NAME = ".rs-sync-state.json";
@@ -16,6 +17,7 @@ type SyncAction = {
   relativePath: string;
   localMtimeMs?: number;
   remoteMtimeMs?: number;
+  reason: string;
 };
 
 type SyncStats = {
@@ -43,6 +45,7 @@ type SyncStateEntry = {
   localMtimeMs: number;
   remoteMtimeMs: number;
   remoteEtag?: string;
+  localHash?: string;
 };
 
 type SyncStateFile = {
@@ -137,6 +140,10 @@ function siteFilePath(basePath: string, relativePath: string): string {
   return `${basePath}/${relativePath}`;
 }
 
+function localAbsolutePath(rootPath: string, relativePath: string): string {
+  return join(rootPath, ...relativePath.split("/"));
+}
+
 function listPath(basePath: string): string {
   return basePath === "/" ? "/" : `${basePath}/`;
 }
@@ -158,35 +165,6 @@ function extractErrorMessage(payload: unknown): string | undefined {
   return undefined;
 }
 
-async function requestBytes(
-  host: string,
-  path: string,
-  method: string,
-  token?: string,
-  body?: Uint8Array,
-): Promise<Response> {
-  const url = new URL(path, host);
-  const headers = new Headers();
-  if (token) {
-    headers.set("cookie", `rs-auth=${token}`);
-  }
-  if (body) {
-    headers.set("content-type", "application/octet-stream");
-  }
-  try {
-    return await fetch(url.toString(), {
-      method,
-      headers,
-      body,
-    });
-  } catch (error) {
-    writeError({
-      error: error instanceof Error ? error.message : String(error),
-      suggestion: "Check network connectivity and the host URL.",
-    });
-  }
-}
-
 async function listRemoteFiles(
   host: string,
   token: string | undefined,
@@ -194,10 +172,10 @@ async function listRemoteFiles(
 ): Promise<Map<string, RemoteFileMeta>> {
   async function fetchRemoteFileMeta(relativePath: string): Promise<RemoteFileMeta> {
     const filePath = siteFilePath(basePath, relativePath);
-    const headResponse = await requestBytes(host, filePath, "HEAD", token);
+    const headResponse = await requestRaw(host, filePath, "HEAD", { token });
     const response = headResponse.ok
       ? headResponse
-      : await requestBytes(host, filePath, "GET", token);
+      : await requestRaw(host, filePath, "GET", { token });
     if (!response.ok) {
       const text = await response.text();
       writeError({
@@ -231,7 +209,7 @@ async function listRemoteFiles(
 
   async function listDirectoryEntries(directoryPath: string): Promise<unknown[]> {
     const requestPath = `${listPath(directoryPath)}?$list=details`;
-    const response = await requestBytes(host, requestPath, "GET", token);
+    const response = await requestRaw(host, requestPath, "GET", { token });
     if (!response.ok) {
       const text = await response.text();
       writeError({
@@ -370,6 +348,10 @@ async function listLocalFiles(rootPath: string): Promise<Map<string, LocalFileMe
   return result;
 }
 
+function fmtMs(ms: number): string {
+  return new Date(ms).toISOString();
+}
+
 function hasMeaningfulTimeDelta(
   leftMs: number,
   rightMs: number,
@@ -403,13 +385,25 @@ function hasLocalChanged(
   return hasMeaningfulTimeDelta(local.mtimeMs, state.localMtimeMs);
 }
 
-function planActions(
+async function hashLocalFile(
+  rootPath: string,
+  relativePath: string,
+): Promise<string> {
+  const bytes = await Deno.readFile(localAbsolutePath(rootPath, relativePath));
+  const digest = await crypto.subtle.digest("SHA-256", bytes);
+  const hashBytes = new Uint8Array(digest);
+  return Array.from(hashBytes).map((byte) => byte.toString(16).padStart(2, "0"))
+    .join("");
+}
+
+async function planActions(
   localFiles: Map<string, LocalFileMeta>,
   remoteFiles: Map<string, RemoteFileMeta>,
   stateFiles: Map<string, SyncStateEntry>,
+  localRoot: string,
   localMode?: SyncMode,
   remoteMode?: SyncMode,
-): { actions: SyncAction[]; stats: SyncStats } {
+): Promise<{ actions: SyncAction[]; stats: SyncStats }> {
   if (localMode === "add" && remoteMode === "delete") {
     writeError({
       error: "Conflicting modes: --local add and --remote delete.",
@@ -449,25 +443,39 @@ function planActions(
     const state = stateFiles.get(path);
 
     if (localMeta && remoteMeta) {
-      const localChanged = hasLocalChanged(localMeta, state);
+      let localChanged = hasLocalChanged(localMeta, state);
       const remoteChanged = hasRemoteChanged(remoteMeta, state);
+      if (localChanged && !remoteChanged && state?.localHash) {
+        const currentHash = await hashLocalFile(localRoot, path);
+        if (currentHash === state.localHash) {
+          localChanged = false;
+        }
+      }
       if (!localChanged && !remoteChanged) {
         stats.noChange++;
         continue;
       }
       if (localChanged && !remoteChanged) {
-        actions.push({
-          type: "upload",
-          relativePath: path,
-          localMtimeMs: localMeta.mtimeMs,
-        });
+        if (localMeta.mtimeMs > remoteMeta.mtimeMs) {
+          const prev = state ? fmtMs(state.localMtimeMs) : "unknown";
+          actions.push({
+            type: "upload",
+            relativePath: path,
+            localMtimeMs: localMeta.mtimeMs,
+            reason: `local modified: ${prev} → ${fmtMs(localMeta.mtimeMs)}`,
+          });
+        } else {
+          stats.noChange++;
+        }
         continue;
       }
       if (!localChanged && remoteChanged) {
+        const prev = state ? fmtMs(state.remoteMtimeMs) : "unknown";
         actions.push({
           type: "download",
           relativePath: path,
           remoteMtimeMs: remoteMeta.mtimeMs,
+          reason: `remote modified: ${prev} → ${fmtMs(remoteMeta.mtimeMs)}`,
         });
         continue;
       }
@@ -479,12 +487,14 @@ function planActions(
           type: "upload",
           relativePath: path,
           localMtimeMs: localMeta.mtimeMs,
+          reason: `conflict: local newer (local: ${fmtMs(localMeta.mtimeMs)}, remote: ${fmtMs(remoteMeta.mtimeMs)})`,
         });
       } else {
         actions.push({
           type: "download",
           relativePath: path,
           remoteMtimeMs: remoteMeta.mtimeMs,
+          reason: `conflict: remote newer (remote: ${fmtMs(remoteMeta.mtimeMs)}, local: ${fmtMs(localMeta.mtimeMs)})`,
         });
       }
       continue;
@@ -496,12 +506,14 @@ function planActions(
           type: "upload",
           relativePath: path,
           localMtimeMs: localMeta.mtimeMs,
+          reason: `new local file (${fmtMs(localMeta.mtimeMs)})`,
         });
       } else if (localMode === "delete") {
         actions.push({
           type: "deleteLocal",
           relativePath: path,
           localMtimeMs: localMeta.mtimeMs,
+          reason: `local-only file`,
         });
       } else {
         stats.ignored++;
@@ -515,12 +527,14 @@ function planActions(
           type: "download",
           relativePath: path,
           remoteMtimeMs: remoteMeta.mtimeMs,
+          reason: `new remote file (${fmtMs(remoteMeta.mtimeMs)})`,
         });
       } else if (remoteMode === "delete") {
         actions.push({
           type: "deleteRemote",
           relativePath: path,
           remoteMtimeMs: remoteMeta.mtimeMs,
+          reason: `remote-only file`,
         });
       } else {
         stats.ignored++;
@@ -574,7 +588,10 @@ async function executeAction(
 
   if (action.type === "upload") {
     const bytes = await Deno.readFile(localPath);
-    const response = await requestBytes(host, remotePath, "PUT", token, bytes);
+    const response = await requestRaw(host, remotePath, "PUT", {
+      token,
+      body: bytes,
+    });
     if (!response.ok) {
       const text = await response.text();
       throw new Error(
@@ -586,7 +603,7 @@ async function executeAction(
   }
 
   if (action.type === "download") {
-    const response = await requestBytes(host, remotePath, "GET", token);
+    const response = await requestRaw(host, remotePath, "GET", { token });
     if (!response.ok) {
       const text = await response.text();
       throw new Error(
@@ -611,7 +628,7 @@ async function executeAction(
   }
 
   if (action.type === "deleteRemote") {
-    const response = await requestBytes(host, remotePath, "DELETE", token);
+    const response = await requestRaw(host, remotePath, "DELETE", { token });
     if (!response.ok && response.status !== 404) {
       const text = await response.text();
       throw new Error(
@@ -673,6 +690,7 @@ async function readSyncState(
         remoteEtag: typeof record.remoteEtag === "string"
           ? record.remoteEtag
           : undefined,
+        localHash: typeof record.localHash === "string" ? record.localHash : undefined,
       });
     }
     return entries;
@@ -696,10 +714,12 @@ async function writeSyncState(
     if (!remoteMeta) {
       continue;
     }
+    const localHash = await hashLocalFile(rootPath, path);
     files[path] = {
       localMtimeMs: localMeta.mtimeMs,
       remoteMtimeMs: remoteMeta.mtimeMs,
       remoteEtag: remoteMeta.etag,
+      localHash,
     };
   }
   const payload: SyncStateFile = {
@@ -715,7 +735,7 @@ export const SYNC_DESCRIPTION =
   "Sync a local directory with a remote Restspace directory (previews changes and asks for confirmation unless --yes is provided).";
 
 export async function runSync(
-  options: { local?: string; remote?: string; yes?: boolean },
+  options: { local?: string; remote?: string; yes?: boolean; verbose?: boolean },
   path: string,
   siteRelativeUrl?: string,
 ): Promise<void> {
@@ -757,10 +777,11 @@ export async function runSync(
   ]);
   const stateFiles = await readSyncState(localRoot, resolvedSitePath);
 
-  const { actions, stats } = planActions(
+  const { actions, stats } = await planActions(
     localFiles,
     remoteFiles,
     stateFiles,
+    localRoot,
     localMode,
     remoteMode,
   );
@@ -781,6 +802,15 @@ export async function runSync(
       noChange: stats.noChange,
       ignored: stats.ignored,
     },
+    ...(options.verbose && actions.length > 0
+      ? {
+        actions: actions.map((a) => ({
+          type: a.type,
+          path: a.relativePath,
+          reason: a.reason,
+        })),
+      }
+      : {}),
   });
 
   if (actions.length > 0 && !options.yes) {
@@ -871,9 +901,10 @@ export function syncCommand() {
     .option("--local <mode:string>", "Local mismatch behavior: add|delete")
     .option("--remote <mode:string>", "Remote mismatch behavior: add|delete")
     .option("-y, --yes", "Bypass confirmation prompt")
+    .option("-v, --verbose", "Show per-file reasons for scheduled uploads/downloads")
     .action(async (options, path, siteRelativeUrl) => {
       await runSync(
-        options as { local?: string; remote?: string; yes?: boolean },
+        options as { local?: string; remote?: string; yes?: boolean; verbose?: boolean },
         path,
         siteRelativeUrl,
       );

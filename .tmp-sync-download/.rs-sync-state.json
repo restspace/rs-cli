@@ -4,19 +4,23 @@
   "files": {
     "blender_webrtc_server.py.jpg": {
       "localMtimeMs": 1748359123481,
-      "remoteMtimeMs": 1748359123481
+      "remoteMtimeMs": 1748359123481,
+      "localHash": "19554aacf14c30045d4c5d34d6ec89188209b4b09550c11bb244bd971e0b81df"
     },
     "DemoBathroom_clay.glb": {
       "localMtimeMs": 1748359835402,
-      "remoteMtimeMs": 1748359835402
+      "remoteMtimeMs": 1748359835402,
+      "localHash": "6d82f6adf2f75d0ea140139213ab290c60dcb46cd4549f2b9b0e90576b232ef9"
     },
     "obs_bridge.py.jpg": {
       "localMtimeMs": 1748353843267,
-      "remoteMtimeMs": 1748353843267
+      "remoteMtimeMs": 1748353843267,
+      "localHash": "e78661ea7c78657aea48027b18d982d4f73a8380ba1dc8bdf33997ddd41e13ea"
     },
     "ProductSnipper.zip.jpg": {
-      "localMtimeMs": 1758615945244,
-      "remoteMtimeMs": 1758615945244
+      "localMtimeMs": 1772615831693,
+      "remoteMtimeMs": 1758615945244,
+      "localHash": "d2049ed8575288489b9d1d78b4b21798b0dc851402a57e9cf02fa9913cc2b766"
     }
   }
 }

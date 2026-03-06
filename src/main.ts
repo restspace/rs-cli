@@ -5,6 +5,7 @@ import { configCommand } from "./commands/config.ts";
 import { discoverCommand } from "./commands/discover.ts";
 import { pipelineCommand } from "./commands/pipeline.ts";
 import { queryCommand } from "./commands/query.ts";
+import { sendCommand } from "./commands/send.ts";
 import { syncCommand } from "./commands/sync.ts";
 
 const app = new Command()
@@ -17,6 +18,7 @@ registerAuthCommands(app);
 app.command("call", callCommand());
 app.command("discover", discoverCommand());
 app.command("pipeline", pipelineCommand());
+app.command("send", sendCommand());
 app.command("sync", syncCommand());
 app.command("query", queryCommand());
 

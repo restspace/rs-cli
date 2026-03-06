@@ -26,6 +26,14 @@ function extractTokenFromCookie(headers: Record<string, string>): string | undef
   return match ? match[1] : undefined;
 }
 
+function extractTokenFromUser(payload: unknown): string | undefined {
+  if (!payload || typeof payload !== "object") {
+    return undefined;
+  }
+  const record = payload as Record<string, unknown>;
+  return typeof record._jwt === "string" ? record._jwt : undefined;
+}
+
 function extractExpiry(payload: unknown): number | undefined {
   if (!payload || typeof payload !== "object") {
     return undefined;
@@ -139,11 +147,12 @@ export function registerAuthCommands(app: Command): void {
         });
       }
 
-      const token = extractTokenFromCookie(response.headers);
+      const token = extractTokenFromCookie(response.headers) ??
+        extractTokenFromUser(response.data);
       if (!token) {
         writeError({
           status: response.status,
-          error: "Login response did not include rs-auth cookie.",
+          error: "Login response did not include rs-auth cookie or user._jwt.",
           suggestion: "Check the server login response.",
         });
       }
