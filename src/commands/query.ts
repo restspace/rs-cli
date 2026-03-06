@@ -1,7 +1,8 @@
 import { Command } from "cliffy/command/mod.ts";
 import { ApiClient, type ApiResponse } from "../lib/api-client.ts";
-import { loadConfig, normalizeHost } from "../lib/config-store.ts";
+import { normalizeHost } from "../lib/config-store.ts";
 import { writeError, writeSuccess } from "../lib/output.ts";
+import { loadAuthReadyConfig } from "../lib/runtime-config.ts";
 
 type BodyOptions = {
   data?: string;
@@ -45,7 +46,9 @@ function parseJsonBody(raw: string): string {
   }
 }
 
-async function resolveJsonBody(options: BodyOptions): Promise<string | undefined> {
+async function resolveJsonBody(
+  options: BodyOptions,
+): Promise<string | undefined> {
   if (options.data && options.file) {
     writeError({
       error: "Provide either --data or --file, not both.",
@@ -62,7 +65,9 @@ async function resolveJsonBody(options: BodyOptions): Promise<string | undefined
   return undefined;
 }
 
-async function resolveTextBody(options: BodyOptions): Promise<string | undefined> {
+async function resolveTextBody(
+  options: BodyOptions,
+): Promise<string | undefined> {
   if (options.data && options.file) {
     writeError({
       error: "Provide either --data or --file, not both.",
@@ -165,7 +170,7 @@ export function queryCommand(): Command {
           suggestion: "Provide a store path, e.g. `rs query list /queries`.",
         });
       }
-      const config = await loadConfig();
+      const config = await loadAuthReadyConfig();
       const host = resolveHost(config.host);
       const client = new ApiClient(host, config.auth?.token);
       await sendRequest(client, "GET", path);
@@ -174,7 +179,7 @@ export function queryCommand(): Command {
   command.command("get <path:string>")
     .description("Get a query template.")
     .action(async (_options, path) => {
-      const config = await loadConfig();
+      const config = await loadAuthReadyConfig();
       const host = resolveHost(config.host);
       const client = new ApiClient(host, config.auth?.token);
       await sendRequest(client, "GET", path);
@@ -192,7 +197,7 @@ export function queryCommand(): Command {
           suggestion: "Provide -d or -f with a query template.",
         });
       }
-      const config = await loadConfig();
+      const config = await loadAuthReadyConfig();
       const host = resolveHost(config.host);
       const client = new ApiClient(host, config.auth?.token);
       await sendRequest(client, "PUT", path, body, {
@@ -206,7 +211,7 @@ export function queryCommand(): Command {
     .option("-f, --file <path:string>", "Read parameters from file")
     .action(async (options, path) => {
       const body = await resolveJsonBody(options);
-      const config = await loadConfig();
+      const config = await loadAuthReadyConfig();
       const host = resolveHost(config.host);
       const client = new ApiClient(host, config.auth?.token);
       await sendRequest(client, "POST", path, body);

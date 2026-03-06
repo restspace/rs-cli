@@ -1,8 +1,9 @@
 import { Command } from "cliffy/command/mod.ts";
 import { dirname } from "std/path/mod.ts";
-import { loadConfig, normalizeHost } from "../lib/config-store.ts";
+import { normalizeHost } from "../lib/config-store.ts";
 import { writeError, writeSuccess } from "../lib/output.ts";
 import { decodeRawResponse, requestRaw } from "../lib/raw-request.ts";
+import { loadAuthReadyConfig } from "../lib/runtime-config.ts";
 
 type BodyOptions = {
   data?: string;
@@ -39,7 +40,7 @@ function parseHeader(value: string): [string, string] {
   if (index <= 0) {
     writeError({
       error: "Header must be in key:value format.",
-      suggestion: "Example: -H \"x-request-id:123\"",
+      suggestion: 'Example: -H "x-request-id:123"',
     });
   }
   const key = value.slice(0, index).trim().toLowerCase();
@@ -47,7 +48,7 @@ function parseHeader(value: string): [string, string] {
   if (!key) {
     writeError({
       error: "Header key cannot be empty.",
-      suggestion: "Example: -H \"x-request-id:123\"",
+      suggestion: 'Example: -H "x-request-id:123"',
     });
   }
   return [key, headerValue];
@@ -58,7 +59,7 @@ function parseQuery(value: string): [string, string] {
   if (index <= 0) {
     writeError({
       error: "Query parameter must be in key=value format.",
-      suggestion: "Example: -q \"limit=10\"",
+      suggestion: 'Example: -q "limit=10"',
     });
   }
   const key = value.slice(0, index).trim();
@@ -66,7 +67,7 @@ function parseQuery(value: string): [string, string] {
   if (!key) {
     writeError({
       error: "Query key cannot be empty.",
-      suggestion: "Example: -q \"limit=10\"",
+      suggestion: 'Example: -q "limit=10"',
     });
   }
   return [key, queryValue];
@@ -105,7 +106,9 @@ function suggestionForStatus(status: number): string {
   return "Verify the request parameters and try again.";
 }
 
-async function resolveBody(options: BodyOptions): Promise<string | Uint8Array | undefined> {
+async function resolveBody(
+  options: BodyOptions,
+): Promise<string | Uint8Array | undefined> {
   if (options.data && options.file) {
     writeError({
       error: "Provide either --data or --file, not both.",
@@ -129,7 +132,10 @@ function responseHeaders(response: Response): Record<string, string> {
   return headers;
 }
 
-async function writeResponseBody(response: Response, outputPath: string): Promise<{
+async function writeResponseBody(
+  response: Response,
+  outputPath: string,
+): Promise<{
   byteLength: number;
   contentType: string | null;
 }> {
@@ -154,7 +160,10 @@ export function sendCommand() {
     .arguments("<method:string> <path:string>")
     .option("-d, --data <text:string>", "Raw request body as inline text")
     .option("-f, --file <path:string>", "Read request body from file as bytes")
-    .option("--content-type <type:string>", "Content-Type header for the request body")
+    .option(
+      "--content-type <type:string>",
+      "Content-Type header for the request body",
+    )
     .option("-o, --output <path:string>", "Write the response body to a file")
     .option("-H, --header <header:string>", "Additional header", {
       collect: true,
@@ -164,7 +173,7 @@ export function sendCommand() {
     })
     .option("--timeout <ms:number>", "Request timeout in milliseconds")
     .action(async (options, method, path) => {
-      const config = await loadConfig();
+      const config = await loadAuthReadyConfig();
       const host = resolveHost(config.host);
       const token = config.auth?.token;
       const body = await resolveBody(options);
@@ -201,7 +210,11 @@ export function sendCommand() {
         method: method.toUpperCase(),
         path,
         duration: durationMs,
-        requestBodySource: options.file ? "file" : options.data !== undefined ? "inline" : "none",
+        requestBodySource: options.file
+          ? "file"
+          : options.data !== undefined
+          ? "inline"
+          : "none",
         responseBodyDestination: options.output ? "file" : "stdout",
       };
 

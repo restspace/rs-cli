@@ -1,7 +1,8 @@
 import { Command } from "cliffy/command/mod.ts";
 import { ApiClient, type ApiResponse } from "../lib/api-client.ts";
-import { loadConfig, normalizeHost } from "../lib/config-store.ts";
+import { normalizeHost } from "../lib/config-store.ts";
 import { writeError, writeSuccess } from "../lib/output.ts";
+import { loadAuthReadyConfig } from "../lib/runtime-config.ts";
 
 function resolveHost(host?: string): string {
   if (!host) {
@@ -45,7 +46,7 @@ function parseHeader(value: string): [string, string] {
   if (index <= 0) {
     writeError({
       error: "Header must be in key:value format.",
-      suggestion: "Example: -H \"x-request-id:123\"",
+      suggestion: 'Example: -H "x-request-id:123"',
     });
   }
   const key = value.slice(0, index).trim();
@@ -53,7 +54,7 @@ function parseHeader(value: string): [string, string] {
   if (!key) {
     writeError({
       error: "Header key cannot be empty.",
-      suggestion: "Example: -H \"x-request-id:123\"",
+      suggestion: 'Example: -H "x-request-id:123"',
     });
   }
   return [key, headerValue];
@@ -64,7 +65,7 @@ function parseQuery(value: string): [string, string] {
   if (index <= 0) {
     writeError({
       error: "Query parameter must be in key=value format.",
-      suggestion: "Example: -q \"limit=10\"",
+      suggestion: 'Example: -q "limit=10"',
     });
   }
   const key = value.slice(0, index).trim();
@@ -72,7 +73,7 @@ function parseQuery(value: string): [string, string] {
   if (!key) {
     writeError({
       error: "Query key cannot be empty.",
-      suggestion: "Example: -q \"limit=10\"",
+      suggestion: 'Example: -q "limit=10"',
     });
   }
   return [key, queryValue];
@@ -132,7 +133,7 @@ export function callCommand() {
         });
       }
 
-      const config = await loadConfig();
+      const config = await loadAuthReadyConfig();
       const host = resolveHost(config.host);
       const token = config.auth?.token;
 

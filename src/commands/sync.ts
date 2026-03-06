@@ -1,8 +1,9 @@
 import { Command } from "cliffy/command/mod.ts";
 import { dirname, join, relative, resolve } from "std/path/mod.ts";
-import { loadConfig, normalizeHost } from "../lib/config-store.ts";
+import { normalizeHost } from "../lib/config-store.ts";
 import { writeError, writeSuccess } from "../lib/output.ts";
 import { requestRaw } from "../lib/raw-request.ts";
+import { loadAuthReadyConfig } from "../lib/runtime-config.ts";
 
 const SYNC_FILE_NAME = ".rs-sync";
 const SYNC_STATE_FILE_NAME = ".rs-sync-state.json";
@@ -170,7 +171,9 @@ async function listRemoteFiles(
   token: string | undefined,
   basePath: string,
 ): Promise<Map<string, RemoteFileMeta>> {
-  async function fetchRemoteFileMeta(relativePath: string): Promise<RemoteFileMeta> {
+  async function fetchRemoteFileMeta(
+    relativePath: string,
+  ): Promise<RemoteFileMeta> {
     const filePath = siteFilePath(basePath, relativePath);
     const headResponse = await requestRaw(host, filePath, "HEAD", { token });
     const response = headResponse.ok
@@ -189,13 +192,15 @@ async function listRemoteFiles(
     if (!lastModified) {
       writeError({
         error: `Remote file '${relativePath}' has no Last-Modified header.`,
-        suggestion: "Ensure the service returns Last-Modified for file resources.",
+        suggestion:
+          "Ensure the service returns Last-Modified for file resources.",
       });
     }
     const parsed = Date.parse(lastModified);
     if (!Number.isFinite(parsed)) {
       writeError({
-        error: `Could not parse Last-Modified for remote file '${relativePath}'.`,
+        error:
+          `Could not parse Last-Modified for remote file '${relativePath}'.`,
         suggestion: "Ensure Last-Modified is a valid HTTP date.",
         details: { lastModified },
       });
@@ -207,7 +212,9 @@ async function listRemoteFiles(
     };
   }
 
-  async function listDirectoryEntries(directoryPath: string): Promise<unknown[]> {
+  async function listDirectoryEntries(
+    directoryPath: string,
+  ): Promise<unknown[]> {
     const requestPath = `${listPath(directoryPath)}?$list=details`;
     const response = await requestRaw(host, requestPath, "GET", { token });
     if (!response.ok) {
@@ -272,7 +279,8 @@ async function listRemoteFiles(
       } else {
         writeError({
           error: "Invalid directory entry returned by server.",
-          suggestion: "Expected entries as names or [name, dateModified] tuples.",
+          suggestion:
+            "Expected entries as names or [name, dateModified] tuples.",
           details: { entry },
         });
       }
@@ -313,7 +321,9 @@ async function listRemoteFiles(
   return result;
 }
 
-async function listLocalFiles(rootPath: string): Promise<Map<string, LocalFileMeta>> {
+async function listLocalFiles(
+  rootPath: string,
+): Promise<Map<string, LocalFileMeta>> {
   const result = new Map<string, LocalFileMeta>();
   const stack = [rootPath];
   while (stack.length > 0) {
@@ -338,8 +348,10 @@ async function listLocalFiles(rootPath: string): Promise<Map<string, LocalFileMe
       const mtimeMs = info.mtime?.getTime();
       if (typeof mtimeMs !== "number" || !Number.isFinite(mtimeMs)) {
         writeError({
-          error: `Local file '${relativePath}' has no valid modified timestamp.`,
-          suggestion: "Ensure local files are on a filesystem with mtime support.",
+          error:
+            `Local file '${relativePath}' has no valid modified timestamp.`,
+          suggestion:
+            "Ensure local files are on a filesystem with mtime support.",
         });
       }
       result.set(relativePath, { mtimeMs: Math.trunc(mtimeMs) });
@@ -487,14 +499,18 @@ async function planActions(
           type: "upload",
           relativePath: path,
           localMtimeMs: localMeta.mtimeMs,
-          reason: `conflict: local newer (local: ${fmtMs(localMeta.mtimeMs)}, remote: ${fmtMs(remoteMeta.mtimeMs)})`,
+          reason: `conflict: local newer (local: ${
+            fmtMs(localMeta.mtimeMs)
+          }, remote: ${fmtMs(remoteMeta.mtimeMs)})`,
         });
       } else {
         actions.push({
           type: "download",
           relativePath: path,
           remoteMtimeMs: remoteMeta.mtimeMs,
-          reason: `conflict: remote newer (remote: ${fmtMs(remoteMeta.mtimeMs)}, local: ${fmtMs(localMeta.mtimeMs)})`,
+          reason: `conflict: remote newer (remote: ${
+            fmtMs(remoteMeta.mtimeMs)
+          }, local: ${fmtMs(localMeta.mtimeMs)})`,
         });
       }
       continue;
@@ -653,7 +669,10 @@ async function readSyncFile(rootPath: string): Promise<string | undefined> {
   }
 }
 
-async function writeSyncFile(rootPath: string, sitePath: string): Promise<void> {
+async function writeSyncFile(
+  rootPath: string,
+  sitePath: string,
+): Promise<void> {
   const syncPath = join(rootPath, SYNC_FILE_NAME);
   await Deno.writeTextFile(syncPath, `${sitePath}\n`);
 }
@@ -669,7 +688,10 @@ async function readSyncState(
       return new Map<string, SyncStateEntry>();
     }
     const parsed = JSON.parse(raw) as Partial<SyncStateFile>;
-    if (parsed.version !== 1 || parsed.siteRelativeUrl !== sitePath || !parsed.files) {
+    if (
+      parsed.version !== 1 || parsed.siteRelativeUrl !== sitePath ||
+      !parsed.files
+    ) {
       return new Map<string, SyncStateEntry>();
     }
     const entries = new Map<string, SyncStateEntry>();
@@ -690,7 +712,9 @@ async function readSyncState(
         remoteEtag: typeof record.remoteEtag === "string"
           ? record.remoteEtag
           : undefined,
-        localHash: typeof record.localHash === "string" ? record.localHash : undefined,
+        localHash: typeof record.localHash === "string"
+          ? record.localHash
+          : undefined,
       });
     }
     return entries;
@@ -735,7 +759,12 @@ export const SYNC_DESCRIPTION =
   "Sync a local directory with a remote Restspace directory (previews changes and asks for confirmation unless --yes is provided).";
 
 export async function runSync(
-  options: { local?: string; remote?: string; yes?: boolean; verbose?: boolean },
+  options: {
+    local?: string;
+    remote?: string;
+    yes?: boolean;
+    verbose?: boolean;
+  },
   path: string,
   siteRelativeUrl?: string,
 ): Promise<void> {
@@ -767,7 +796,7 @@ export async function runSync(
     siteRelativeUrl?.trim() || storedSitePath || "",
   );
 
-  const config = await loadConfig();
+  const config = await loadAuthReadyConfig();
   const host = resolveHost(config.host);
   const token = config.auth?.token;
 
@@ -840,7 +869,9 @@ export async function runSync(
     await writeSyncState(localRoot, resolvedSitePath, localFiles, remoteFiles);
   }
 
-  const failures: Array<{ action: SyncActionType; path: string; error: string }> = [];
+  const failures: Array<
+    { action: SyncActionType; path: string; error: string }
+  > = [];
   for (const action of actions) {
     try {
       await executeAction(
@@ -901,10 +932,18 @@ export function syncCommand() {
     .option("--local <mode:string>", "Local mismatch behavior: add|delete")
     .option("--remote <mode:string>", "Remote mismatch behavior: add|delete")
     .option("-y, --yes", "Bypass confirmation prompt")
-    .option("-v, --verbose", "Show per-file reasons for scheduled uploads/downloads")
+    .option(
+      "-v, --verbose",
+      "Show per-file reasons for scheduled uploads/downloads",
+    )
     .action(async (options, path, siteRelativeUrl) => {
       await runSync(
-        options as { local?: string; remote?: string; yes?: boolean; verbose?: boolean },
+        options as {
+          local?: string;
+          remote?: string;
+          yes?: boolean;
+          verbose?: boolean;
+        },
         path,
         siteRelativeUrl,
       );

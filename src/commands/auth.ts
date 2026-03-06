@@ -2,79 +2,20 @@ import { Command } from "cliffy/command/mod.ts";
 import { ApiClient, type ApiResponse } from "../lib/api-client.ts";
 import {
   loadConfig,
+  loadProjectConfig,
+  loadUserConfig,
   normalizeHost,
-  resolvePassword,
   saveConfig,
 } from "../lib/config-store.ts";
+import {
+  AuthSessionError,
+  extractErrorMessage,
+  isAuthExpired,
+  loginWithCredentials,
+  nowSeconds,
+} from "../lib/auth-session.ts";
 import { writeError, writeSuccess } from "../lib/output.ts";
-
-function nowSeconds(): number {
-  return Math.floor(Date.now() / 1000);
-}
-
-function normalizeExpiry(value: number): number {
-  return value > 1_000_000_000_000 ? Math.floor(value / 1000) : value;
-}
-
-function extractTokenFromCookie(headers: Record<string, string>): string | undefined {
-  const setCookie = headers["set-cookie"];
-  if (!setCookie) {
-    return undefined;
-  }
-  // Parse rs-auth cookie value from set-cookie header
-  const match = setCookie.match(/rs-auth=([^;]+)/);
-  return match ? match[1] : undefined;
-}
-
-function extractTokenFromUser(payload: unknown): string | undefined {
-  if (!payload || typeof payload !== "object") {
-    return undefined;
-  }
-  const record = payload as Record<string, unknown>;
-  return typeof record._jwt === "string" ? record._jwt : undefined;
-}
-
-function extractExpiry(payload: unknown): number | undefined {
-  if (!payload || typeof payload !== "object") {
-    return undefined;
-  }
-  const record = payload as Record<string, unknown>;
-  if (typeof record.expiry === "number") {
-    return normalizeExpiry(record.expiry);
-  }
-  if (typeof record.expiresAt === "number") {
-    return normalizeExpiry(record.expiresAt);
-  }
-  if (typeof record.expiresIn === "number") {
-    return nowSeconds() + record.expiresIn;
-  }
-  return undefined;
-}
-
-function extractUser(payload: unknown): unknown {
-  if (!payload || typeof payload !== "object") {
-    return undefined;
-  }
-  const record = payload as Record<string, unknown>;
-  return record.user;
-}
-
-function extractErrorMessage(payload: unknown): string | undefined {
-  if (typeof payload === "string") {
-    return payload;
-  }
-  if (!payload || typeof payload !== "object") {
-    return undefined;
-  }
-  const record = payload as Record<string, unknown>;
-  if (typeof record.error === "string") {
-    return record.error;
-  }
-  if (typeof record.message === "string") {
-    return record.message;
-  }
-  return undefined;
-}
+import { loadAuthReadyConfig } from "../lib/runtime-config.ts";
 
 function resolveHost(host?: string): string {
   if (!host) {
@@ -108,6 +49,8 @@ export function registerAuthCommands(app: Command): void {
     .option("--email <email:string>", "Login email")
     .option("--password <password:string>", "Login password")
     .action(async (options) => {
+      const userConfig = await loadUserConfig();
+      const project = await loadProjectConfig();
       const config = await loadConfig();
       const host = resolveHost(options.host ?? config.host);
       const email = options.email ?? config.credentials?.email;
@@ -117,73 +60,65 @@ export function registerAuthCommands(app: Command): void {
           suggestion: "Run `rs config set email <email>` or pass --email.",
         });
       }
-      const password = options.password ?? resolvePassword(config);
+      const password = options.password ?? Deno.env.get("RS_PASSWORD") ??
+        config.credentials?.password;
       if (!password) {
         writeError({
           error: "Missing password.",
-          suggestion: "Set RS_PASSWORD or run `rs config set password <value>`.",
+          suggestion:
+            "Set RS_PASSWORD or run `rs config set password <value>`.",
         });
       }
 
-      const client = new ApiClient(host);
-      let response: ApiResponse;
       try {
-        response = await client.request("POST", "/auth/login", {
-          body: JSON.stringify({ email, password }),
+        const session = await loginWithCredentials(host, email, password);
+        const credentials = { ...userConfig.credentials };
+        credentials.email = email;
+        if (options.password) {
+          credentials.password = options.password;
+        }
+
+        const nextConfig = {
+          ...userConfig,
+          credentials: credentials.email || credentials.password
+            ? credentials
+            : undefined,
+          auth: {
+            token: session.token,
+            expiry: session.expiry,
+            host,
+          },
+        };
+        if (options.host || !project.path) {
+          nextConfig.host = host;
+        }
+
+        await saveConfig(nextConfig);
+
+        writeSuccess({
+          auth: {
+            expiry: session.expiry,
+            tokenStored: true,
+          },
+          user: session.user,
         });
       } catch (error) {
-        writeError({
-          error: error instanceof Error ? error.message : String(error),
-          suggestion: "Check network connectivity and the host URL.",
-        });
+        if (error instanceof AuthSessionError) {
+          writeError({
+            status: error.status,
+            error: error.message,
+            suggestion: error.suggestion,
+            details: error.details,
+          });
+        }
+        throw error;
       }
-
-      if (response.status < 200 || response.status >= 300) {
-        writeError({
-          status: response.status,
-          error: extractErrorMessage(response.data) ??
-            "Login failed.",
-          suggestion: "Verify the email and password.",
-        });
-      }
-
-      const token = extractTokenFromCookie(response.headers) ??
-        extractTokenFromUser(response.data);
-      if (!token) {
-        writeError({
-          status: response.status,
-          error: "Login response did not include rs-auth cookie or user._jwt.",
-          suggestion: "Check the server login response.",
-        });
-      }
-
-      const expiry = extractExpiry(response.data);
-      const credentials = { ...config.credentials, email };
-      if (options.password) {
-        credentials.password = options.password;
-      }
-      const nextConfig = {
-        ...config,
-        host,
-        credentials,
-        auth: { token, expiry },
-      };
-      await saveConfig(nextConfig);
-
-      const user = extractUser(response.data);
-      writeSuccess({
-        auth: {
-          expiry,
-          tokenStored: true,
-        },
-        user,
-      });
     });
 
   app.command("logout")
     .description("Clear cached authentication token.")
     .action(async () => {
-      const config = await loadConfig();
+      const config = await loadUserConfig();
       if (!config.auth?.token) {
         writeSuccess({ message: "No auth token to clear." });
         return;
@@ -197,7 +132,7 @@ export function registerAuthCommands(app: Command): void {
   app.command("whoami")
     .description("Show current user info and token validity.")
     .action(async () => {
-      const config = await loadConfig();
+      const config = await loadAuthReadyConfig();
       const host = resolveHost(config.host);
       const token = config.auth?.token;
       if (!token) {
@@ -208,7 +143,7 @@ export function registerAuthCommands(app: Command): void {
       }
 
       const expiry = config.auth?.expiry;
-      if (expiry && expiry <= nowSeconds()) {
+      if (isAuthExpired(expiry)) {
         writeError({
           error: "Auth token expired.",
           suggestion: "Run `rs login` to refresh credentials.",

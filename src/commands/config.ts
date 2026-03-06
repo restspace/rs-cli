@@ -3,6 +3,8 @@ import {
   configExists,
   getConfigPath,
   loadConfig,
+  loadProjectConfig,
+  loadUserConfig,
   maskConfigForOutput,
   normalizeHost,
   saveConfig,
@@ -30,7 +32,9 @@ function normalizeAndValidateHost(host: string): string {
 
 export function configCommand(): Command {
   const command = new Command()
-    .description("Manage CLI configuration.\n\nConfigurable values: host, email, password")
+    .description(
+      "Manage CLI configuration.\n\nConfigurable values: host, email, password",
+    )
     .action(function () {
       this.showHelp();
     });
@@ -75,7 +79,7 @@ export function configCommand(): Command {
   setCommand.command("host <url:string>")
     .description("Set the Restspace host URL.")
     .action(async (_options, url) => {
-      const config = await loadConfig();
+      const config = await loadUserConfig();
       config.host = normalizeAndValidateHost(url);
       await saveConfig(config);
       writeSuccess({
@@ -87,7 +91,7 @@ export function configCommand(): Command {
   setCommand.command("email <email:string>")
     .description("Set the login email.")
     .action(async (_options, email) => {
-      const config = await loadConfig();
+      const config = await loadUserConfig();
       config.credentials = { ...config.credentials, email };
       await saveConfig(config);
       writeSuccess({
@@ -99,7 +103,7 @@ export function configCommand(): Command {
   setCommand.command("password <password:string>")
     .description("Set the login password.")
     .action(async (_options, password) => {
-      const config = await loadConfig();
+      const config = await loadUserConfig();
       config.credentials = { ...config.credentials, password };
       await saveConfig(config);
       writeSuccess({
@@ -113,16 +117,22 @@ export function configCommand(): Command {
   command.command("show")
     .description("Show the current config.")
     .action(async () => {
-      if (!(await configExists())) {
+      const globalConfig = await loadUserConfig();
+      const projectConfig = await loadProjectConfig();
+      if (!(await configExists()) && !projectConfig.path) {
         writeError({
           error: "Config file not found.",
-          suggestion: "Run `rs config init` or `rs config set host <url>`.",
+          suggestion:
+            "Run `rs config init`, `rs config set host <url>`, or add rsconfig.json.",
         });
       }
       const config = await loadConfig();
       writeSuccess({
-        configPath: getConfigPath(),
-        config: maskConfigForOutput(config),
+        globalConfigPath: getConfigPath(),
+        globalConfig: maskConfigForOutput(globalConfig),
+        projectConfigPath: projectConfig.path ?? null,
+        projectConfig: maskConfigForOutput(projectConfig.config),
+        effectiveConfig: maskConfigForOutput(config),
       });
     });
 

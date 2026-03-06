@@ -1,7 +1,8 @@
 import { Command } from "cliffy/command/mod.ts";
 import { ApiClient, type ApiResponse } from "../lib/api-client.ts";
-import { loadConfig, normalizeHost } from "../lib/config-store.ts";
+import { normalizeHost } from "../lib/config-store.ts";
 import { writeError, writeSuccess } from "../lib/output.ts";
+import { loadAuthReadyConfig } from "../lib/runtime-config.ts";
 
 type BodyOptions = {
   data?: string;
@@ -145,10 +146,11 @@ export function pipelineCommand(): Command {
       if (!path) {
         writeError({
           error: "Missing pipeline store path.",
-          suggestion: "Provide a store path, e.g. `rs pipeline list /pipelines`.",
+          suggestion:
+            "Provide a store path, e.g. `rs pipeline list /pipelines`.",
         });
       }
-      const config = await loadConfig();
+      const config = await loadAuthReadyConfig();
       const host = resolveHost(config.host);
       const client = new ApiClient(host, config.auth?.token);
       await sendRequest(client, "GET", path);
@@ -157,7 +159,7 @@ export function pipelineCommand(): Command {
   command.command("get <path:string>")
     .description("Get a pipeline spec.")
     .action(async (_options, path) => {
-      const config = await loadConfig();
+      const config = await loadAuthReadyConfig();
       const host = resolveHost(config.host);
       const client = new ApiClient(host, config.auth?.token);
       await sendRequest(client, "GET", path);
@@ -175,7 +177,7 @@ export function pipelineCommand(): Command {
           suggestion: "Provide -d or -f with a JSON pipeline spec.",
         });
       }
-      const config = await loadConfig();
+      const config = await loadAuthReadyConfig();
       const host = resolveHost(config.host);
       const client = new ApiClient(host, config.auth?.token);
       await sendRequest(client, "PUT", path, body);
@@ -187,7 +189,7 @@ export function pipelineCommand(): Command {
     .option("-f, --file <path:string>", "Read payload from file")
     .action(async (options, path) => {
       const body = await resolveBody(options);
-      const config = await loadConfig();
+      const config = await loadAuthReadyConfig();
       const host = resolveHost(config.host);
       const client = new ApiClient(host, config.auth?.token);
       await sendRequest(client, "POST", path, body);

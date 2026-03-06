@@ -1,7 +1,8 @@
 import { Command } from "cliffy/command/mod.ts";
 import { ApiClient, type ApiResponse } from "../lib/api-client.ts";
-import { loadConfig, normalizeHost } from "../lib/config-store.ts";
+import { normalizeHost } from "../lib/config-store.ts";
 import { writeError, writeSuccess } from "../lib/output.ts";
+import { loadAuthReadyConfig } from "../lib/runtime-config.ts";
 
 const SERVICES_ENDPOINT = "/.well-known/restspace/services";
 const AGENT_DISCOVERY_ENDPOINT =
@@ -175,7 +176,7 @@ export function discoverCommand() {
   command.command("services")
     .description("List all configured services.")
     .action(async () => {
-      const config = await loadConfig();
+      const config = await loadAuthReadyConfig();
       const host = resolveHost(config.host);
       const client = new ApiClient(host, config.auth?.token);
       const agentDiscovery = await loadAgentDiscovery(client);
@@ -190,7 +191,7 @@ export function discoverCommand() {
   command.command("service <basePath:string>")
     .description("Get details for a single service.")
     .action(async (_options, basePath) => {
-      const config = await loadConfig();
+      const config = await loadAuthReadyConfig();
       const host = resolveHost(config.host);
       const client = new ApiClient(host, config.auth?.token);
       const agentDiscovery = await loadAgentDiscovery(client);
@@ -210,7 +211,7 @@ export function discoverCommand() {
   command.command("patterns")
     .description("Explain all API patterns.")
     .action(async () => {
-      const config = await loadConfig();
+      const config = await loadAuthReadyConfig();
       const host = resolveHost(config.host);
       const client = new ApiClient(host, config.auth?.token);
       const agentDiscovery = await loadAgentDiscovery(client);
@@ -225,12 +226,14 @@ export function discoverCommand() {
   command.command("pattern <name:string>")
     .description("Explain a specific API pattern.")
     .action(async (_options, name) => {
-      const config = await loadConfig();
+      const config = await loadAuthReadyConfig();
       const host = resolveHost(config.host);
       const client = new ApiClient(host, config.auth?.token);
       const agentDiscovery = await loadAgentDiscovery(client);
       let patterns: Record<string, unknown> = {};
-      if (agentDiscovery?.patterns && typeof agentDiscovery.patterns === "object") {
+      if (
+        agentDiscovery?.patterns && typeof agentDiscovery.patterns === "object"
+      ) {
         patterns = agentDiscovery.patterns as Record<string, unknown>;
       } else {
         const loaded = await loadJsonFile("../concepts/patterns.json");
@@ -251,7 +254,7 @@ export function discoverCommand() {
   command.command("concepts")
     .description("Explain all Restspace concepts.")
     .action(async () => {
-      const config = await loadConfig();
+      const config = await loadAuthReadyConfig();
       const host = resolveHost(config.host);
       const client = new ApiClient(host, config.auth?.token);
       const agentDiscovery = await loadAgentDiscovery(client);
