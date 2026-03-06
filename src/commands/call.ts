@@ -111,7 +111,7 @@ function suggestionForStatus(status: number): string {
   return "Verify the request parameters and try again.";
 }
 
-export function callCommand(): Command {
+export function callCommand() {
   return new Command()
     .description("Call a Restspace API endpoint.")
     .arguments("<method:string> <path:string>")

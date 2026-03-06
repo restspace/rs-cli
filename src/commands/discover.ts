@@ -84,7 +84,9 @@ function coerceServiceList(data: unknown): ServiceEntry[] {
         ? { ...(value as JsonRecord) }
         : {};
       const apis = entry.apis;
-      const pattern = entry.pattern ?? patternFromApis(apis);
+      const pattern = typeof entry.pattern === "string"
+        ? entry.pattern
+        : patternFromApis(apis);
       if (pattern && !entry.patternDescription) {
         entry.patternDescription = patternDescriptions[pattern];
       }
@@ -166,7 +168,7 @@ async function loadConcepts(): Promise<Record<string, unknown>> {
   return concepts;
 }
 
-export function discoverCommand(): Command {
+export function discoverCommand() {
   const command = new Command()
     .description("Discover available services and patterns.");
 
@@ -261,12 +263,9 @@ export function discoverCommand(): Command {
       writeSuccess({ concepts });
     });
 
-  command.command("concept <name>")
-    .arguments("<name>")
+  command.command("concept <name:string>")
     .description("Explain a specific concept.")
-    .action(async (options: Record<string, unknown>, name: string) => {
-      console.log("CONCEPT ACTION CALLED with:", name, "options:", options);
-      // Load concepts from local files (server override not yet implemented)
+    .action(async (_options, name) => {
       const concepts = await loadConcepts();
       const concept = concepts[name];
       if (!concept) {
