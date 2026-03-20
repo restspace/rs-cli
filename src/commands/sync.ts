@@ -8,6 +8,7 @@ import { loadAuthReadyConfig } from "../lib/runtime-config.ts";
 const SYNC_FILE_NAME = ".rs-sync";
 const SYNC_STATE_FILE_NAME = ".rs-sync-state.json";
 const CLOCK_SKEW_WINDOW_MS = 60_000;
+const MANAGE_HEADERS = { "X-Restspace-Request-Mode": "manage" };
 
 type SyncMode = "add" | "delete";
 
@@ -92,20 +93,35 @@ function resolveHost(host?: string): string {
   return normalizeHost(parsed.toString());
 }
 
-function parseMode(
+function parseModes(
   side: "local" | "remote",
-  value?: string,
-): SyncMode | undefined {
+  value?: string | string[],
+): SyncMode[] {
   if (!value) {
-    return undefined;
+    return [];
   }
-  if (value === "add" || value === "delete") {
-    return value;
+  const values = Array.isArray(value) ? value : [value];
+  const modes: SyncMode[] = [];
+  for (const entry of values) {
+    if (entry === "add" || entry === "delete") {
+      if (!modes.includes(entry)) {
+        modes.push(entry);
+      }
+      continue;
+    }
+    writeError({
+      error: `Invalid --${side} mode '${entry}'.`,
+      suggestion: `Use --${side} add or --${side} delete.`,
+    });
   }
-  writeError({
-    error: `Invalid --${side} mode '${value}'.`,
-    suggestion: `Use --${side} add or --${side} delete.`,
-  });
+  return modes;
+}
+
+function hasMode(
+  modes: SyncMode[],
+  mode: SyncMode,
+): boolean {
+  return modes.includes(mode);
 }
 
 function normalizeSitePath(path: string): string {
@@ -175,10 +191,16 @@ async function listRemoteFiles(
     relativePath: string,
   ): Promise<RemoteFileMeta> {
     const filePath = siteFilePath(basePath, relativePath);
-    const headResponse = await requestRaw(host, filePath, "HEAD", { token });
+    const headResponse = await requestRaw(host, filePath, "HEAD", {
+      token,
+      headers: MANAGE_HEADERS,
+    });
     const response = headResponse.ok
       ? headResponse
-      : await requestRaw(host, filePath, "GET", { token });
+      : await requestRaw(host, filePath, "GET", {
+        token,
+        headers: MANAGE_HEADERS,
+      });
     if (!response.ok) {
       const text = await response.text();
       writeError({
@@ -216,7 +238,10 @@ async function listRemoteFiles(
     directoryPath: string,
   ): Promise<unknown[]> {
     const requestPath = `${listPath(directoryPath)}?$list=details`;
-    const response = await requestRaw(host, requestPath, "GET", { token });
+    const response = await requestRaw(host, requestPath, "GET", {
+      token,
+      headers: MANAGE_HEADERS,
+    });
     if (!response.ok) {
       const text = await response.text();
       writeError({
@@ -408,22 +433,22 @@ async function hashLocalFile(
     .join("");
 }
 
-async function planActions(
+export async function planActions(
   localFiles: Map<string, LocalFileMeta>,
   remoteFiles: Map<string, RemoteFileMeta>,
   stateFiles: Map<string, SyncStateEntry>,
   localRoot: string,
-  localMode?: SyncMode,
-  remoteMode?: SyncMode,
+  localModes: SyncMode[] = [],
+  remoteModes: SyncMode[] = [],
 ): Promise<{ actions: SyncAction[]; stats: SyncStats }> {
-  if (localMode === "add" && remoteMode === "delete") {
+  if (hasMode(localModes, "add") && hasMode(remoteModes, "delete")) {
     writeError({
       error: "Conflicting modes: --local add and --remote delete.",
       suggestion:
         "Pick one behavior for remote-only files (add locally OR delete remotely).",
     });
   }
-  if (localMode === "delete" && remoteMode === "add") {
+  if (hasMode(localModes, "delete") && hasMode(remoteModes, "add")) {
     writeError({
       error: "Conflicting modes: --local delete and --remote add.",
       suggestion:
@@ -517,14 +542,14 @@ async function planActions(
     }
 
     if (localMeta) {
-      if (remoteMode === "add") {
+      if (hasMode(remoteModes, "add")) {
         actions.push({
           type: "upload",
           relativePath: path,
           localMtimeMs: localMeta.mtimeMs,
           reason: `new local file (${fmtMs(localMeta.mtimeMs)})`,
         });
-      } else if (localMode === "delete") {
+      } else if (hasMode(localModes, "delete")) {
         actions.push({
           type: "deleteLocal",
           relativePath: path,
@@ -538,14 +563,14 @@ async function planActions(
     }
 
     if (remoteMeta) {
-      if (localMode === "add") {
+      if (hasMode(localModes, "add")) {
         actions.push({
           type: "download",
           relativePath: path,
           remoteMtimeMs: remoteMeta.mtimeMs,
           reason: `new remote file (${fmtMs(remoteMeta.mtimeMs)})`,
         });
-      } else if (remoteMode === "delete") {
+      } else if (hasMode(remoteModes, "delete")) {
         actions.push({
           type: "deleteRemote",
           relativePath: path,
@@ -607,6 +632,7 @@ async function executeAction(
     const response = await requestRaw(host, remotePath, "PUT", {
       token,
       body: bytes,
+      headers: MANAGE_HEADERS,
     });
     if (!response.ok) {
       const text = await response.text();
@@ -619,7 +645,10 @@ async function executeAction(
   }
 
   if (action.type === "download") {
-    const response = await requestRaw(host, remotePath, "GET", { token });
+    const response = await requestRaw(host, remotePath, "GET", {
+      token,
+      headers: MANAGE_HEADERS,
+    });
     if (!response.ok) {
       const text = await response.text();
       throw new Error(
@@ -644,7 +673,10 @@ async function executeAction(
   }
 
   if (action.type === "deleteRemote") {
-    const response = await requestRaw(host, remotePath, "DELETE", { token });
+    const response = await requestRaw(host, remotePath, "DELETE", {
+      token,
+      headers: MANAGE_HEADERS,
+    });
     if (!response.ok && response.status !== 404) {
       const text = await response.text();
       throw new Error(
@@ -760,8 +792,8 @@ export const SYNC_DESCRIPTION =
 
 export async function runSync(
   options: {
-    local?: string;
-    remote?: string;
+    local?: string | string[];
+    remote?: string | string[];
     yes?: boolean;
     verbose?: boolean;
   },
@@ -788,8 +820,8 @@ export async function runSync(
     });
   }
 
-  const localMode = parseMode("local", options.local);
-  const remoteMode = parseMode("remote", options.remote);
+  const localModes = parseModes("local", options.local);
+  const remoteModes = parseModes("remote", options.remote);
 
   const storedSitePath = await readSyncFile(localRoot);
   const resolvedSitePath = normalizeSitePath(
@@ -811,8 +843,8 @@ export async function runSync(
     remoteFiles,
     stateFiles,
     localRoot,
-    localMode,
-    remoteMode,
+    localModes,
+    remoteModes,
   );
   const planned = summarizePlan(actions);
 
@@ -821,8 +853,8 @@ export async function runSync(
     path: localRoot,
     siteRelativeUrl: resolvedSitePath,
     modes: {
-      local: localMode ?? null,
-      remote: remoteMode ?? null,
+      local: localModes.length > 0 ? localModes : null,
+      remote: remoteModes.length > 0 ? remoteModes : null,
     },
     planned,
     analysis: {
@@ -918,8 +950,8 @@ export async function runSync(
     path: localRoot,
     siteRelativeUrl: resolvedSitePath,
     modes: {
-      local: localMode ?? null,
-      remote: remoteMode ?? null,
+      local: localModes.length > 0 ? localModes : null,
+      remote: remoteModes.length > 0 ? remoteModes : null,
     },
     stats,
   });
@@ -929,8 +961,16 @@ export function syncCommand() {
   return new Command()
     .description(SYNC_DESCRIPTION)
     .arguments("<path:string> [siteRelativeUrl:string]")
-    .option("--local <mode:string>", "Local mismatch behavior: add|delete")
-    .option("--remote <mode:string>", "Remote mismatch behavior: add|delete")
+    .option(
+      "--local <mode:string>",
+      "Local mismatch behavior: add|delete (repeatable)",
+      { collect: true },
+    )
+    .option(
+      "--remote <mode:string>",
+      "Remote mismatch behavior: add|delete (repeatable)",
+      { collect: true },
+    )
     .option("-y, --yes", "Bypass confirmation prompt")
     .option(
       "-v, --verbose",
@@ -939,8 +979,8 @@ export function syncCommand() {
     .action(async (options, path, siteRelativeUrl) => {
       await runSync(
         options as {
-          local?: string;
-          remote?: string;
+          local?: string | string[];
+          remote?: string | string[];
           yes?: boolean;
           verbose?: boolean;
         },
