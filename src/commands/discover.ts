@@ -5,11 +5,16 @@ import { writeError, writeSuccess } from "../lib/output.ts";
 import { loadAuthReadyConfig } from "../lib/runtime-config.ts";
 
 const SERVICES_ENDPOINT = "/.well-known/restspace/services";
+const CATALOGUE_ENDPOINT = "/.well-known/restspace/services/catalogue";
 const AGENT_DISCOVERY_ENDPOINT =
   "/.well-known/restspace/services/agent-discovery";
 
 type JsonRecord = Record<string, unknown>;
-type ServiceEntry = JsonRecord & { basePath: string };
+export type ServiceEntry = JsonRecord & { basePath: string };
+type CatalogueMatch = {
+  key: string;
+  entry: JsonRecord;
+};
 type AgentDiscovery = {
   services?: unknown;
   patterns?: unknown;
@@ -70,7 +75,7 @@ const patternDescriptions: Record<string, string> = {
   directory: "Fixed URL structure",
 };
 
-function coerceServiceList(data: unknown): ServiceEntry[] {
+export function coerceServiceList(data: unknown): ServiceEntry[] {
   if (Array.isArray(data)) {
     return data.filter((entry) =>
       entry && typeof entry === "object" && "basePath" in entry
@@ -99,12 +104,17 @@ function coerceServiceList(data: unknown): ServiceEntry[] {
   );
 }
 
+function manageHeaders(manage?: boolean): Record<string, string> | undefined {
+  return manage ? { "X-Restspace-Request-Mode": "manage" } : undefined;
+}
+
 async function request(
   client: ApiClient,
   path: string,
+  headers?: Record<string, string>,
 ): Promise<ApiResponse> {
   try {
-    return await client.request("GET", path);
+    return await client.request("GET", path, { headers });
   } catch (error) {
     writeError({
       error: error instanceof Error ? error.message : String(error),
@@ -113,10 +123,11 @@ async function request(
   }
 }
 
-async function loadAgentDiscovery(
+export async function loadAgentDiscovery(
   client: ApiClient,
+  headers?: Record<string, string>,
 ): Promise<AgentDiscovery | null> {
-  const response = await request(client, AGENT_DISCOVERY_ENDPOINT);
+  const response = await request(client, AGENT_DISCOVERY_ENDPOINT, headers);
   if (response.status === 404) {
     return null;
   }
@@ -134,8 +145,11 @@ async function loadAgentDiscovery(
   return response.data as AgentDiscovery;
 }
 
-async function loadServices(client: ApiClient): Promise<ServiceEntry[]> {
-  const response = await request(client, SERVICES_ENDPOINT);
+export async function loadServices(
+  client: ApiClient,
+  headers?: Record<string, string>,
+): Promise<ServiceEntry[]> {
+  const response = await request(client, SERVICES_ENDPOINT, headers);
   if (response.status < 200 || response.status >= 300) {
     writeError({
       status: response.status,
@@ -145,6 +159,66 @@ async function loadServices(client: ApiClient): Promise<ServiceEntry[]> {
     });
   }
   return coerceServiceList(response.data);
+}
+
+export async function loadCatalogue(
+  client: ApiClient,
+  headers?: Record<string, string>,
+): Promise<unknown> {
+  const response = await request(client, CATALOGUE_ENDPOINT, headers);
+  if (response.status < 200 || response.status >= 300) {
+    writeError({
+      status: response.status,
+      error: "Failed to load the service catalogue.",
+      suggestion: "Check server configuration or permissions.",
+      details: response.data,
+    });
+  }
+  return response.data;
+}
+
+function isRecord(value: unknown): value is JsonRecord {
+  return !!value && typeof value === "object" && !Array.isArray(value);
+}
+
+export function findCatalogueEntry(
+  catalogue: unknown,
+  lookup: string,
+): CatalogueMatch | null {
+  if (Array.isArray(catalogue)) {
+    for (const item of catalogue) {
+      if (!isRecord(item)) continue;
+      if (
+        item.basePath === lookup ||
+        item.name === lookup ||
+        item.key === lookup
+      ) {
+        const key = typeof item.basePath === "string"
+          ? item.basePath
+          : typeof item.name === "string"
+          ? item.name
+          : lookup;
+        return { key, entry: item };
+      }
+    }
+    return null;
+  }
+  if (!isRecord(catalogue)) {
+    return null;
+  }
+  const direct = catalogue[lookup];
+  if (isRecord(direct)) {
+    return { key: lookup, entry: direct };
+  }
+  for (const [key, value] of Object.entries(catalogue)) {
+    if (
+      isRecord(value) &&
+      (value.basePath === lookup || value.name === lookup || value.key === lookup)
+    ) {
+      return { key, entry: value };
+    }
+  }
+  return null;
 }
 
 async function loadJsonFile(relativePath: string): Promise<unknown> {
@@ -171,33 +245,68 @@ async function loadConcepts(): Promise<Record<string, unknown>> {
 
 export function discoverCommand() {
   const command = new Command()
-    .description("Discover available services and patterns.");
+    .description("Discover available services and patterns.")
+    .globalOption("--manage", "Set X-Restspace-Request-Mode: manage on requests");
 
   command.command("services")
     .description("List all configured services.")
-    .action(async () => {
+    .action(async (options) => {
       const config = await loadAuthReadyConfig();
       const host = resolveHost(config.host);
       const client = new ApiClient(host, config.auth?.token);
-      const agentDiscovery = await loadAgentDiscovery(client);
+      const hdrs = manageHeaders(options.manage);
+      const agentDiscovery = await loadAgentDiscovery(client, hdrs);
       if (agentDiscovery?.services) {
         writeSuccess({ services: coerceServiceList(agentDiscovery.services) });
         return;
       }
-      const services = await loadServices(client);
+      const services = await loadServices(client, hdrs);
       writeSuccess({ services });
+    });
+
+  command.command("catalogue")
+    .description("Show the full service and adapter catalogue.")
+    .action(async (options) => {
+      const config = await loadAuthReadyConfig();
+      const host = resolveHost(config.host);
+      const client = new ApiClient(host, config.auth?.token);
+      const catalogue = await loadCatalogue(client, manageHeaders(options.manage));
+      writeSuccess({ catalogue });
+    });
+
+  command.command("catalogue <name:string>")
+    .description("Get one service or adapter catalogue entry.")
+    .action(async (options, name) => {
+      const config = await loadAuthReadyConfig();
+      const host = resolveHost(config.host);
+      const client = new ApiClient(host, config.auth?.token);
+      const catalogue = await loadCatalogue(client, manageHeaders(options.manage));
+      const match = findCatalogueEntry(catalogue, name);
+      if (!match) {
+        writeError({
+          error: "Catalogue entry not found.",
+          suggestion: "Run `rs discover catalogue` to list available entries.",
+        });
+      }
+      writeSuccess({
+        catalogueEntry: {
+          key: match.key,
+          ...match.entry,
+        },
+      });
     });
 
   command.command("service <basePath:string>")
     .description("Get details for a single service.")
-    .action(async (_options, basePath) => {
+    .action(async (options, basePath) => {
       const config = await loadAuthReadyConfig();
       const host = resolveHost(config.host);
       const client = new ApiClient(host, config.auth?.token);
-      const agentDiscovery = await loadAgentDiscovery(client);
+      const hdrs = manageHeaders(options.manage);
+      const agentDiscovery = await loadAgentDiscovery(client, hdrs);
       const services = agentDiscovery?.services
         ? coerceServiceList(agentDiscovery.services)
-        : await loadServices(client);
+        : await loadServices(client, hdrs);
       const service = services.find((entry) => entry.basePath === basePath);
       if (!service) {
         writeError({
@@ -210,11 +319,11 @@ export function discoverCommand() {
 
   command.command("patterns")
     .description("Explain all API patterns.")
-    .action(async () => {
+    .action(async (options) => {
       const config = await loadAuthReadyConfig();
       const host = resolveHost(config.host);
       const client = new ApiClient(host, config.auth?.token);
-      const agentDiscovery = await loadAgentDiscovery(client);
+      const agentDiscovery = await loadAgentDiscovery(client, manageHeaders(options.manage));
       if (agentDiscovery?.patterns) {
         writeSuccess({ patterns: agentDiscovery.patterns });
         return;
@@ -225,11 +334,11 @@ export function discoverCommand() {
 
   command.command("pattern <name:string>")
     .description("Explain a specific API pattern.")
-    .action(async (_options, name) => {
+    .action(async (options, name) => {
       const config = await loadAuthReadyConfig();
       const host = resolveHost(config.host);
       const client = new ApiClient(host, config.auth?.token);
-      const agentDiscovery = await loadAgentDiscovery(client);
+      const agentDiscovery = await loadAgentDiscovery(client, manageHeaders(options.manage));
       let patterns: Record<string, unknown> = {};
       if (
         agentDiscovery?.patterns && typeof agentDiscovery.patterns === "object"
@@ -253,11 +362,11 @@ export function discoverCommand() {
 
   command.command("concepts")
     .description("Explain all Restspace concepts.")
-    .action(async () => {
+    .action(async (options) => {
       const config = await loadAuthReadyConfig();
       const host = resolveHost(config.host);
       const client = new ApiClient(host, config.auth?.token);
-      const agentDiscovery = await loadAgentDiscovery(client);
+      const agentDiscovery = await loadAgentDiscovery(client, manageHeaders(options.manage));
       if (agentDiscovery?.concepts) {
         writeSuccess({ concepts: agentDiscovery.concepts });
         return;
