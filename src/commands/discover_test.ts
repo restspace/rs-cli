@@ -1,6 +1,15 @@
-import { assertEquals } from "https://deno.land/std@0.224.0/assert/mod.ts";
-import { findCatalogueEntry, loadCatalogue } from "./discover.ts";
+import {
+  assertEquals,
+  assertExists,
+} from "https://deno.land/std@0.224.0/assert/mod.ts";
+import { discoverCommand, findCatalogueEntry, loadCatalogue } from "./discover.ts";
 import type { ApiClient } from "../lib/api-client.ts";
+
+Deno.test("discoverCommand constructs without duplicate subcommand names", () => {
+  const command = discoverCommand();
+
+  assertExists(command);
+});
 
 Deno.test("loadCatalogue fetches the service catalogue endpoint", async () => {
   const calls: Array<[string, string]> = [];

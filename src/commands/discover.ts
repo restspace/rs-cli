@@ -264,23 +264,17 @@ export function discoverCommand() {
       writeSuccess({ services });
     });
 
-  command.command("catalogue")
-    .description("Show the full service and adapter catalogue.")
-    .action(async (options) => {
+  command.command("catalogue [name:string]")
+    .description("Show the full catalogue or one service or adapter entry.")
+    .action(async (options, name?: string) => {
       const config = await loadAuthReadyConfig();
       const host = resolveHost(config.host);
       const client = new ApiClient(host, config.auth?.token);
       const catalogue = await loadCatalogue(client, manageHeaders(options.manage));
-      writeSuccess({ catalogue });
-    });
-
-  command.command("catalogue <name:string>")
-    .description("Get one service or adapter catalogue entry.")
-    .action(async (options, name) => {
-      const config = await loadAuthReadyConfig();
-      const host = resolveHost(config.host);
-      const client = new ApiClient(host, config.auth?.token);
-      const catalogue = await loadCatalogue(client, manageHeaders(options.manage));
+      if (!name) {
+        writeSuccess({ catalogue });
+        return;
+      }
       const match = findCatalogueEntry(catalogue, name);
       if (!match) {
         writeError({
