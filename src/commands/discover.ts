@@ -1,16 +1,25 @@
 import { Command } from "cliffy/command/mod.ts";
 import { ApiClient, type ApiResponse } from "../lib/api-client.ts";
 import { normalizeHost } from "../lib/config-store.ts";
-import { writeError, writeSuccess } from "../lib/output.ts";
+import { writeError, writeRaw, writeSuccess } from "../lib/output.ts";
+import { requestRaw } from "../lib/raw-request.ts";
 import { loadAuthReadyConfig } from "../lib/runtime-config.ts";
 
 const SERVICES_ENDPOINT = "/.well-known/restspace/services";
+const SERVICES_JSONC_ENDPOINT = "/services.jsonc";
 const CATALOGUE_ENDPOINT = "/.well-known/restspace/services/catalogue";
 const AGENT_DISCOVERY_ENDPOINT =
   "/.well-known/restspace/services/agent-discovery";
+const AGENT_DISCOVERY_RAW_ENDPOINT =
+  "/.well-known/restspace/services/agent-discovery/raw.jsonc";
 
 type JsonRecord = Record<string, unknown>;
 export type ServiceEntry = JsonRecord & { basePath: string };
+export type ServiceSummary = {
+  description: string;
+  name: string;
+  basePath: string;
+};
 type CatalogueMatch = {
   key: string;
   entry: JsonRecord;
@@ -19,6 +28,11 @@ type AgentDiscovery = {
   services?: unknown;
   patterns?: unknown;
   concepts?: unknown;
+};
+type ScanState = {
+  inString: boolean;
+  escape: boolean;
+  depth: number;
 };
 
 function resolveHost(host?: string): string {
@@ -145,6 +159,406 @@ export async function loadAgentDiscovery(
   return response.data as AgentDiscovery;
 }
 
+export async function loadAgentDiscoveryJsonc(
+  host: string,
+  token?: string,
+  headers?: Record<string, string>,
+): Promise<string> {
+  const response = await requestRaw(host, AGENT_DISCOVERY_RAW_ENDPOINT, "GET", {
+    token,
+    headers,
+  });
+  const text = await response.text();
+  if (response.status < 200 || response.status >= 300) {
+    writeError({
+      status: response.status,
+      error: "Failed to load agent discovery data.",
+      suggestion: "Check server configuration or permissions.",
+      details: text,
+    });
+  }
+  return text;
+}
+
+export async function loadServicesJsonc(
+  host: string,
+  token?: string,
+  headers?: Record<string, string>,
+): Promise<string> {
+  const response = await requestRaw(host, SERVICES_JSONC_ENDPOINT, "GET", {
+    token,
+    headers,
+  });
+  const text = await response.text();
+  if (response.status < 200 || response.status >= 300) {
+    writeError({
+      status: response.status,
+      error: "Failed to load services.jsonc.",
+      suggestion: "Check server configuration or permissions.",
+      details: text,
+    });
+  }
+  return text;
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function updateScanState(line: string, state: ScanState): ScanState {
+  let { inString, escape, depth } = state;
+  for (let index = 0; index < line.length; index++) {
+    const char = line[index];
+    const next = line[index + 1];
+    if (inString) {
+      if (escape) {
+        escape = false;
+        continue;
+      }
+      if (char === "\\") {
+        escape = true;
+        continue;
+      }
+      if (char === '"') {
+        inString = false;
+      }
+      continue;
+    }
+    if (char === '"') {
+      inString = true;
+      continue;
+    }
+    if (char === "/" && next === "/") {
+      break;
+    }
+    if (char === "{") {
+      depth++;
+      continue;
+    }
+    if (char === "}") {
+      depth--;
+    }
+  }
+  return { inString, escape, depth };
+}
+
+function findObjectEndLine(lines: string[], startLine: number): number | null {
+  let state: ScanState = {
+    inString: false,
+    escape: false,
+    depth: 0,
+  };
+  for (let index = startLine; index < lines.length; index++) {
+    state = updateScanState(lines[index], state);
+    if (state.depth === 0) {
+      return index;
+    }
+  }
+  return null;
+}
+
+export function extractServiceJsonc(
+  raw: string,
+  basePath: string,
+): string | null {
+  const normalized = raw.replace(/\r\n/g, "\n");
+  const lines = normalized.split("\n");
+  const servicesLineIndex = lines.findIndex((line) =>
+    /^\s*"services"\s*:\s*\{\s*$/.test(line)
+  );
+  if (servicesLineIndex < 0) {
+    return null;
+  }
+
+  const servicesEndLine = findObjectEndLine(lines, servicesLineIndex);
+  if (servicesEndLine === null) {
+    return null;
+  }
+
+  const serviceLinePattern = new RegExp(
+    `^\\s*${escapeRegExp(JSON.stringify(basePath))}\\s*:\\s*\\{\\s*$`,
+  );
+  let serviceLineIndex = -1;
+  for (
+    let index = servicesLineIndex + 1;
+    index < servicesEndLine;
+    index++
+  ) {
+    if (serviceLinePattern.test(lines[index])) {
+      serviceLineIndex = index;
+      break;
+    }
+  }
+  if (serviceLineIndex < 0) {
+    return null;
+  }
+
+  let snippetStart = serviceLineIndex;
+  while (
+    snippetStart > servicesLineIndex + 1 &&
+    lines[snippetStart - 1].trimStart().startsWith("//")
+  ) {
+    snippetStart--;
+  }
+
+  const serviceEndLine = findObjectEndLine(lines, serviceLineIndex);
+  if (serviceEndLine === null || serviceEndLine > servicesEndLine) {
+    return null;
+  }
+
+  const snippetLines = lines.slice(snippetStart, serviceEndLine + 1);
+  const lastLineIndex = snippetLines.length - 1;
+  snippetLines[lastLineIndex] = snippetLines[lastLineIndex].replace(
+    /,\s*$/,
+    "",
+  );
+  return snippetLines.join("\n");
+}
+
+function stripJsoncComments(raw: string): string {
+  let output = "";
+  let inString = false;
+  let escape = false;
+  let inLineComment = false;
+  let inBlockComment = false;
+
+  for (let index = 0; index < raw.length; index++) {
+    const char = raw[index];
+    const next = raw[index + 1];
+
+    if (inLineComment) {
+      if (char === "\n" || char === "\r") {
+        inLineComment = false;
+        output += char;
+      }
+      continue;
+    }
+
+    if (inBlockComment) {
+      if (char === "\n" || char === "\r") {
+        output += char;
+        continue;
+      }
+      if (char === "*" && next === "/") {
+        inBlockComment = false;
+        index++;
+      }
+      continue;
+    }
+
+    if (inString) {
+      output += char;
+      if (escape) {
+        escape = false;
+        continue;
+      }
+      if (char === "\\") {
+        escape = true;
+        continue;
+      }
+      if (char === '"') {
+        inString = false;
+      }
+      continue;
+    }
+
+    if (char === '"') {
+      inString = true;
+      output += char;
+      continue;
+    }
+
+    if (char === "/" && next === "/") {
+      inLineComment = true;
+      index++;
+      continue;
+    }
+
+    if (char === "/" && next === "*") {
+      inBlockComment = true;
+      index++;
+      continue;
+    }
+
+    output += char;
+  }
+
+  return output;
+}
+
+function removeTrailingCommas(json: string): string {
+  let output = "";
+  let inString = false;
+  let escape = false;
+
+  for (let index = 0; index < json.length; index++) {
+    const char = json[index];
+
+    if (inString) {
+      output += char;
+      if (escape) {
+        escape = false;
+        continue;
+      }
+      if (char === "\\") {
+        escape = true;
+        continue;
+      }
+      if (char === '"') {
+        inString = false;
+      }
+      continue;
+    }
+
+    if (char === '"') {
+      inString = true;
+      output += char;
+      continue;
+    }
+
+    if (char === ",") {
+      let nextIndex = index + 1;
+      while (/\s/.test(json[nextIndex] ?? "")) {
+        nextIndex++;
+      }
+      if (json[nextIndex] === "}" || json[nextIndex] === "]") {
+        continue;
+      }
+    }
+
+    output += char;
+  }
+
+  return output;
+}
+
+function parseJsonc(raw: string): unknown {
+  return JSON.parse(removeTrailingCommas(stripJsoncComments(raw)));
+}
+
+function cleanLineComment(line: string): string {
+  return line.trimStart().replace(/^\/\/\s?/, "").trimEnd();
+}
+
+function cleanBlockComment(lines: string[]): string {
+  const joined = lines.join("\n");
+  const content = joined
+    .replace(/^[\s\S]*?\/\*/, "")
+    .replace(/\*\/[\s\S]*$/, "");
+  return content
+    .split("\n")
+    .map((line) => line.trim().replace(/^\*\s?/, "").trimEnd())
+    .join("\n")
+    .trim();
+}
+
+function extractLeadingServiceComment(raw: string, basePath: string): string {
+  const lines = raw.replace(/\r\n/g, "\n").split("\n");
+  const serviceLinePattern = new RegExp(
+    `^\\s*${escapeRegExp(JSON.stringify(basePath))}\\s*:`,
+  );
+  const serviceLineIndex = lines.findIndex((line) =>
+    serviceLinePattern.test(line)
+  );
+  if (serviceLineIndex < 1) {
+    return "";
+  }
+
+  const chunks: string[] = [];
+  let index = serviceLineIndex - 1;
+  while (index >= 0) {
+    const line = lines[index];
+    const trimmedStart = line.trimStart();
+    const trimmedEnd = line.trimEnd();
+
+    if (trimmedStart.startsWith("//")) {
+      const commentLines: string[] = [];
+      while (index >= 0 && lines[index].trimStart().startsWith("//")) {
+        commentLines.unshift(cleanLineComment(lines[index]));
+        index--;
+      }
+      chunks.unshift(commentLines.join("\n").trim());
+      continue;
+    }
+
+    if (trimmedEnd.endsWith("*/")) {
+      const blockLines: string[] = [];
+      while (index >= 0) {
+        blockLines.unshift(lines[index]);
+        if (lines[index].includes("/*")) {
+          break;
+        }
+        index--;
+      }
+      if (blockLines[0]?.includes("/*")) {
+        chunks.unshift(cleanBlockComment(blockLines));
+        index--;
+        continue;
+      }
+    }
+
+    break;
+  }
+
+  return chunks.filter(Boolean).join("\n").trim();
+}
+
+function prependDescription(comment: string, description: string): string {
+  if (comment && description) {
+    return `${comment}\n\n${description}`;
+  }
+  return comment || description;
+}
+
+export function parseServicesJsoncSummaries(raw: string): ServiceSummary[] {
+  const parsed = parseJsonc(raw);
+  const services = isRecord(parsed) && isRecord(parsed.services)
+    ? parsed.services
+    : parsed;
+
+  if (Array.isArray(services)) {
+    return services
+      .filter(isRecord)
+      .map((service) => {
+        const basePath = typeof service.basePath === "string"
+          ? service.basePath
+          : "";
+        const comment = basePath
+          ? extractLeadingServiceComment(raw, basePath)
+          : "";
+        const description = typeof service.description === "string"
+          ? service.description
+          : "";
+        return {
+          description: prependDescription(comment, description),
+          name: typeof service.name === "string" ? service.name : "",
+          basePath,
+        };
+      });
+  }
+
+  if (!isRecord(services)) {
+    return [];
+  }
+
+  const summaries: ServiceSummary[] = [];
+  for (const [basePath, service] of Object.entries(services)) {
+    if (!isRecord(service)) {
+      continue;
+    }
+    const description = typeof service.description === "string"
+      ? service.description
+      : "";
+    const comment = extractLeadingServiceComment(raw, basePath);
+    summaries.push({
+      description: prependDescription(comment, description),
+      name: typeof service.name === "string" ? service.name : "",
+      basePath,
+    });
+  }
+  return summaries;
+}
+
 export async function loadServices(
   client: ApiClient,
   headers?: Record<string, string>,
@@ -213,7 +627,8 @@ export function findCatalogueEntry(
   for (const [key, value] of Object.entries(catalogue)) {
     if (
       isRecord(value) &&
-      (value.basePath === lookup || value.name === lookup || value.key === lookup)
+      (value.basePath === lookup || value.name === lookup ||
+        value.key === lookup)
     ) {
       return { key, entry: value };
     }
@@ -246,22 +661,24 @@ async function loadConcepts(): Promise<Record<string, unknown>> {
 export function discoverCommand() {
   const command = new Command()
     .description("Discover available services and patterns.")
-    .globalOption("--manage", "Set X-Restspace-Request-Mode: manage on requests");
+    .globalOption(
+      "--manage",
+      "Set X-Restspace-Request-Mode: manage on requests",
+    );
 
   command.command("services")
     .description("List all configured services.")
     .action(async (options) => {
       const config = await loadAuthReadyConfig();
       const host = resolveHost(config.host);
-      const client = new ApiClient(host, config.auth?.token);
       const hdrs = manageHeaders(options.manage);
-      const agentDiscovery = await loadAgentDiscovery(client, hdrs);
-      if (agentDiscovery?.services) {
-        writeSuccess({ services: coerceServiceList(agentDiscovery.services) });
-        return;
-      }
-      const services = await loadServices(client, hdrs);
-      writeSuccess({ services });
+      const jsonc = await loadServicesJsonc(
+        host,
+        config.auth?.token,
+        hdrs,
+      );
+      const services = parseServicesJsoncSummaries(jsonc);
+      writeRaw(`${JSON.stringify(services, null, 2)}\n`);
     });
 
   command.command("catalogue [name:string]")
@@ -270,7 +687,10 @@ export function discoverCommand() {
       const config = await loadAuthReadyConfig();
       const host = resolveHost(config.host);
       const client = new ApiClient(host, config.auth?.token);
-      const catalogue = await loadCatalogue(client, manageHeaders(options.manage));
+      const catalogue = await loadCatalogue(
+        client,
+        manageHeaders(options.manage),
+      );
       if (!name) {
         writeSuccess({ catalogue });
         return;
@@ -295,20 +715,20 @@ export function discoverCommand() {
     .action(async (options, basePath) => {
       const config = await loadAuthReadyConfig();
       const host = resolveHost(config.host);
-      const client = new ApiClient(host, config.auth?.token);
       const hdrs = manageHeaders(options.manage);
-      const agentDiscovery = await loadAgentDiscovery(client, hdrs);
-      const services = agentDiscovery?.services
-        ? coerceServiceList(agentDiscovery.services)
-        : await loadServices(client, hdrs);
-      const service = services.find((entry) => entry.basePath === basePath);
-      if (!service) {
+      const jsonc = await loadAgentDiscoveryJsonc(
+        host,
+        config.auth?.token,
+        hdrs,
+      );
+      const snippet = extractServiceJsonc(jsonc, basePath);
+      if (!snippet) {
         writeError({
           error: "Service not found.",
           suggestion: "Run `rs discover services` to list valid base paths.",
         });
       }
-      writeSuccess({ service });
+      writeRaw(`${snippet}\n`);
     });
 
   command.command("patterns")
@@ -317,7 +737,10 @@ export function discoverCommand() {
       const config = await loadAuthReadyConfig();
       const host = resolveHost(config.host);
       const client = new ApiClient(host, config.auth?.token);
-      const agentDiscovery = await loadAgentDiscovery(client, manageHeaders(options.manage));
+      const agentDiscovery = await loadAgentDiscovery(
+        client,
+        manageHeaders(options.manage),
+      );
       if (agentDiscovery?.patterns) {
         writeSuccess({ patterns: agentDiscovery.patterns });
         return;
@@ -332,7 +755,10 @@ export function discoverCommand() {
       const config = await loadAuthReadyConfig();
       const host = resolveHost(config.host);
       const client = new ApiClient(host, config.auth?.token);
-      const agentDiscovery = await loadAgentDiscovery(client, manageHeaders(options.manage));
+      const agentDiscovery = await loadAgentDiscovery(
+        client,
+        manageHeaders(options.manage),
+      );
       let patterns: Record<string, unknown> = {};
       if (
         agentDiscovery?.patterns && typeof agentDiscovery.patterns === "object"
@@ -360,7 +786,10 @@ export function discoverCommand() {
       const config = await loadAuthReadyConfig();
       const host = resolveHost(config.host);
       const client = new ApiClient(host, config.auth?.token);
-      const agentDiscovery = await loadAgentDiscovery(client, manageHeaders(options.manage));
+      const agentDiscovery = await loadAgentDiscovery(
+        client,
+        manageHeaders(options.manage),
+      );
       if (agentDiscovery?.concepts) {
         writeSuccess({ concepts: agentDiscovery.concepts });
         return;
