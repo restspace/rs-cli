@@ -39,7 +39,7 @@ Deno.test("loadCatalogue fetches the service catalogue endpoint", async () => {
 
   const catalogue = await loadCatalogue(client);
 
-  assertEquals(calls, [["GET", "/.well-known/restspace/services/catalogue"]]);
+  assertEquals(calls, [["GET", "/.well-known/restspace/catalogue"]]);
   assertEquals(catalogue, {
     services: [{ name: "Data Service" }],
     adapters: [{ name: "MongoDbDataAdapter" }],

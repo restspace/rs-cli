@@ -263,7 +263,7 @@
     "apis": ["services"],
     "endpoints": {
       "GET /.well-known/restspace/services": "List all configured services",
-      "GET /.well-known/restspace/services/catalogue": "Full service and adapter catalogue",
+      "GET /.well-known/restspace/catalogue": "Full service and adapter catalogue",
       "GET /.well-known/restspace/services/agent-discovery": "Agent discovery information",
       "GET /.well-known/restspace/services/openApi": "OpenAPI specification"
     }

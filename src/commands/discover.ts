@@ -7,7 +7,7 @@ import { loadAuthReadyConfig } from "../lib/runtime-config.ts";
 
 const SERVICES_ENDPOINT = "/.well-known/restspace/services";
 const SERVICES_JSONC_ENDPOINT = "/services.jsonc";
-const CATALOGUE_ENDPOINT = "/.well-known/restspace/services/catalogue";
+const CATALOGUE_ENDPOINT = "/.well-known/restspace/catalogue";
 const AGENT_DISCOVERY_ENDPOINT =
   "/.well-known/restspace/services/agent-discovery";
 const AGENT_DISCOVERY_RAW_ENDPOINT =
