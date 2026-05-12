@@ -1,19 +1,12 @@
-import {
-  assertEquals,
-  assertExists,
-} from "https://deno.land/std@0.224.0/assert/mod.ts";
-import { stub } from "https://deno.land/std@0.224.0/testing/mock.ts";
+import { assertEquals, assertExists } from "std/assert/mod.ts";
+import { stub } from "std/testing/mock.ts";
 import {
   discoverCommand,
   extractServiceJsonc,
-  findCatalogueEntry,
   loadAgentDiscoveryJsonc,
   loadCatalogue,
-  loadServicesJsonc,
   parseServicesJsoncSummaries,
-  summarizeCatalogue,
 } from "./discover.ts";
-import type { ApiClient } from "../lib/api-client.ts";
 
 Deno.test("discoverCommand constructs without duplicate subcommand names", () => {
   const command = discoverCommand();
@@ -21,36 +14,80 @@ Deno.test("discoverCommand constructs without duplicate subcommand names", () =>
   assertExists(command);
 });
 
-Deno.test("loadCatalogue fetches the service catalogue endpoint", async () => {
-  const calls: Array<[string, string]> = [];
-  const client = {
-    request: async (method: string, path: string) => {
-      calls.push([method, path]);
-      return {
-        status: 200,
-        headers: {},
-        data: {
-          services: [{ name: "Data Service" }],
-          adapters: [{ name: "MongoDbDataAdapter" }],
-        },
-        durationMs: 1,
-      };
-    },
-  } as ApiClient;
-
-  const catalogue = await loadCatalogue(client);
-
-  assertEquals(calls, [["GET", "/.well-known/restspace/catalogue"]]);
-  assertEquals(catalogue, {
-    services: [{ name: "Data Service" }],
-    adapters: [{ name: "MongoDbDataAdapter" }],
+Deno.test("loadCatalogue fetches the catalogue agent-discovery endpoint", async () => {
+  const calls: Array<{ url: string; method?: string }> = [];
+  const payload = `{"services":[{"name":"Data Service"}]}`;
+  const fetchStub = stub(globalThis, "fetch", async (input, init) => {
+    await Promise.resolve();
+    const request = new Request(input, init);
+    calls.push({
+      url: request.url,
+      method: request.method,
+    });
+    return new Response(payload, {
+      status: 200,
+      headers: {
+        "content-type": "application/json",
+      },
+    });
   });
+
+  try {
+    const catalogue = await loadCatalogue("https://tenant.restspace.io");
+
+    assertEquals(calls, [{
+      url:
+        "https://tenant.restspace.io/.well-known/restspace/catalogue/agent-discovery",
+      method: "GET",
+    }]);
+    assertEquals(catalogue, payload);
+  } finally {
+    fetchStub.restore();
+  }
+});
+
+Deno.test("loadCatalogue fetches a named catalogue agent-discovery endpoint", async () => {
+  const calls: Array<{ url: string; method?: string }> = [];
+  const payload = `{"name":"Data Service"}`;
+  const fetchStub = stub(globalThis, "fetch", async (input, init) => {
+    await Promise.resolve();
+    const request = new Request(input, init);
+    calls.push({
+      url: request.url,
+      method: request.method,
+    });
+    return new Response(payload, {
+      status: 200,
+      headers: {
+        "content-type": "application/json",
+      },
+    });
+  });
+
+  try {
+    const catalogue = await loadCatalogue(
+      "https://tenant.restspace.io",
+      undefined,
+      undefined,
+      "Data Service",
+    );
+
+    assertEquals(calls, [{
+      url:
+        "https://tenant.restspace.io/.well-known/restspace/catalogue/agent-discovery/Data%20Service",
+      method: "GET",
+    }]);
+    assertEquals(catalogue, payload);
+  } finally {
+    fetchStub.restore();
+  }
 });
 
 Deno.test("loadAgentDiscoveryJsonc fetches raw.jsonc and preserves comments", async () => {
   const calls: Array<{ url: string; method?: string }> = [];
   const rawJsonc = `{\\n  // service comments\\n  "services": []\\n}`;
   const fetchStub = stub(globalThis, "fetch", async (input, init) => {
+    await Promise.resolve();
     const request = new Request(input, init);
     calls.push({
       url: request.url,
@@ -68,90 +105,7 @@ Deno.test("loadAgentDiscoveryJsonc fetches raw.jsonc and preserves comments", as
     const text = await loadAgentDiscoveryJsonc("https://tenant.restspace.io");
 
     assertEquals(calls, [{
-      url:
-        "https://tenant.restspace.io/.well-known/restspace/services/agent-discovery/raw.jsonc",
-      method: "GET",
-    }]);
-    assertEquals(text, rawJsonc);
-  } finally {
-    fetchStub.restore();
-  }
-});
-
-Deno.test("summarizeCatalogue maps service and adapter names to descriptions", () => {
-  const summary = summarizeCatalogue({
-    services: [
-      { name: "Data Service", description: "Read/write generic data." },
-      { name: "File Service" },
-      { description: "Ignored without a name." },
-    ],
-    adapters: [
-      {
-        name: "MongoDbDataAdapter",
-        description: "Store data in MongoDB.",
-      },
-    ],
-  });
-
-  assertEquals(summary, {
-    services: {
-      "Data Service": "Read/write generic data.",
-      "File Service": "",
-    },
-    adapters: {
-      MongoDbDataAdapter: "Store data in MongoDB.",
-    },
-  });
-});
-
-Deno.test("summarizeCatalogue uses only catalogue services and adapters", () => {
-  const summary = summarizeCatalogue({
-    data: { name: "Legacy Data", description: "Ignored top-level entry." },
-    services: {
-      data: { name: "Data Service", description: "Read/write generic data." },
-    },
-    adapters: {
-      mongo: { name: "MongoDbDataAdapter" },
-    },
-  });
-
-  assertEquals(summary, {
-    services: {
-      "Data Service": "Read/write generic data.",
-    },
-    adapters: {
-      MongoDbDataAdapter: "",
-    },
-  });
-});
-
-Deno.test("loadServicesJsonc fetches /services.jsonc and preserves comments", async () => {
-  const calls: Array<{ url: string; method?: string }> = [];
-  const rawJsonc = `{
-  // service comments
-  "/admin": {
-    "name": "Admin"
-  }
-}`;
-  const fetchStub = stub(globalThis, "fetch", async (input, init) => {
-    const request = new Request(input, init);
-    calls.push({
-      url: request.url,
-      method: request.method,
-    });
-    return new Response(rawJsonc, {
-      status: 200,
-      headers: {
-        "content-type": "application/json",
-      },
-    });
-  });
-
-  try {
-    const text = await loadServicesJsonc("https://tenant.restspace.io");
-
-    assertEquals(calls, [{
-      url: "https://tenant.restspace.io/services.jsonc",
+      url: "https://tenant.restspace.io/.well-known/restspace/raw.jsonc",
       method: "GET",
     }]);
     assertEquals(text, rawJsonc);
@@ -264,31 +218,4 @@ Deno.test("extractServiceJsonc returns the matching service without a trailing c
       "name": "Logs"
     }`,
   );
-});
-
-Deno.test("findCatalogueEntry finds entries by key, name, and basePath", () => {
-  const objectCatalogue = {
-    data: { name: "Data Service", basePath: "/data" },
-    services: { name: "Services Service" },
-  };
-  const arrayCatalogue = [
-    { key: "template", name: "Template Service", basePath: "/templates" },
-  ];
-
-  assertEquals(findCatalogueEntry(objectCatalogue, "data"), {
-    key: "data",
-    entry: { name: "Data Service", basePath: "/data" },
-  });
-  assertEquals(findCatalogueEntry(objectCatalogue, "Services Service"), {
-    key: "services",
-    entry: { name: "Services Service" },
-  });
-  assertEquals(findCatalogueEntry(arrayCatalogue, "/templates"), {
-    key: "/templates",
-    entry: {
-      key: "template",
-      name: "Template Service",
-      basePath: "/templates",
-    },
-  });
 });

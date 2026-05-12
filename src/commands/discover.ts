@@ -6,12 +6,10 @@ import { requestRaw } from "../lib/raw-request.ts";
 import { loadAuthReadyConfig } from "../lib/runtime-config.ts";
 
 const SERVICES_ENDPOINT = "/.well-known/restspace/services";
-const SERVICES_JSONC_ENDPOINT = "/services.jsonc";
-const CATALOGUE_ENDPOINT = "/.well-known/restspace/catalogue";
+const CATALOGUE_ENDPOINT = "/.well-known/restspace/catalogue/agent-discovery";
 const AGENT_DISCOVERY_ENDPOINT =
   "/.well-known/restspace/services/agent-discovery";
-const AGENT_DISCOVERY_RAW_ENDPOINT =
-  "/.well-known/restspace/services/agent-discovery/raw.jsonc";
+const AGENT_DISCOVERY_RAW_ENDPOINT = "/.well-known/restspace/raw.jsonc";
 
 type JsonRecord = Record<string, unknown>;
 export type ServiceEntry = JsonRecord & { basePath: string };
@@ -177,27 +175,6 @@ export async function loadAgentDiscoveryJsonc(
     writeError({
       status: response.status,
       error: "Failed to load agent discovery data.",
-      suggestion: "Check server configuration or permissions.",
-      details: text,
-    });
-  }
-  return text;
-}
-
-export async function loadServicesJsonc(
-  host: string,
-  token?: string,
-  headers?: Record<string, string>,
-): Promise<string> {
-  const response = await requestRaw(host, SERVICES_JSONC_ENDPOINT, "GET", {
-    token,
-    headers,
-  });
-  const text = await response.text();
-  if (response.status < 200 || response.status >= 300) {
-    writeError({
-      status: response.status,
-      error: "Failed to load services.jsonc.",
       suggestion: "Check server configuration or permissions.",
       details: text,
     });
@@ -580,19 +557,28 @@ export async function loadServices(
 }
 
 export async function loadCatalogue(
-  client: ApiClient,
+  host: string,
+  token?: string,
   headers?: Record<string, string>,
-): Promise<unknown> {
-  const response = await request(client, CATALOGUE_ENDPOINT, headers);
+  name?: string,
+): Promise<string> {
+  const endpoint = name
+    ? `${CATALOGUE_ENDPOINT}/${encodeURIComponent(name)}`
+    : CATALOGUE_ENDPOINT;
+  const response = await requestRaw(host, endpoint, "GET", {
+    token,
+    headers,
+  });
+  const text = await response.text();
   if (response.status < 200 || response.status >= 300) {
     writeError({
       status: response.status,
       error: "Failed to load the service catalogue.",
       suggestion: "Check server configuration or permissions.",
-      details: response.data,
+      details: text,
     });
   }
-  return response.data;
+  return text;
 }
 
 function isRecord(value: unknown): value is JsonRecord {
@@ -703,7 +689,7 @@ export function discoverCommand() {
       const config = await loadAuthReadyConfig();
       const host = resolveHost(config.host);
       const hdrs = manageHeaders(options.manage);
-      const jsonc = await loadServicesJsonc(
+      const jsonc = await loadAgentDiscoveryJsonc(
         host,
         config.auth?.token,
         hdrs,
@@ -713,32 +699,17 @@ export function discoverCommand() {
     });
 
   command.command("catalogue [name:string]")
-    .description("Show the full catalogue or one service or adapter entry.")
+    .description("Echo catalogue agent-discovery output.")
     .action(async (options, name?: string) => {
       const config = await loadAuthReadyConfig();
       const host = resolveHost(config.host);
-      const client = new ApiClient(host, config.auth?.token);
       const catalogue = await loadCatalogue(
-        client,
+        host,
+        config.auth?.token,
         manageHeaders(options.manage),
+        name,
       );
-      if (!name) {
-        writeRaw(`${JSON.stringify(summarizeCatalogue(catalogue), null, 2)}\n`);
-        return;
-      }
-      const match = findCatalogueEntry(catalogue, name);
-      if (!match) {
-        writeError({
-          error: "Catalogue entry not found.",
-          suggestion: "Run `rs discover catalogue` to list available entries.",
-        });
-      }
-      writeSuccess({
-        catalogueEntry: {
-          key: match.key,
-          ...match.entry,
-        },
-      });
+      writeRaw(catalogue.endsWith("\n") ? catalogue : `${catalogue}\n`);
     });
 
   command.command("service <basePath:string>")

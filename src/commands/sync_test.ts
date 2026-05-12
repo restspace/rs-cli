@@ -1,4 +1,4 @@
-import { assertEquals } from "https://deno.land/std@0.224.0/assert/mod.ts";
+import { assertEquals } from "std/assert/mod.ts";
 import { planActions } from "./sync.ts";
 
 Deno.test("planActions supports add and delete on remote", async () => {

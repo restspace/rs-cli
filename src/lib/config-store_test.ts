@@ -1,7 +1,4 @@
-import {
-  assert,
-  assertEquals,
-} from "https://deno.land/std@0.224.0/assert/mod.ts";
+import { assert, assertEquals } from "std/assert/mod.ts";
 import { join, normalize } from "std/path/mod.ts";
 import {
   findProjectConfigPath,
@@ -152,12 +149,12 @@ Deno.test("loadConfig auto-login uses rsconfig.json credentials and caches auth 
       const config = await loadConfig({
         cwd,
         autoLogin: true,
-        login: async (host, email, password) => {
+        login: (host, email, password) => {
           loginCalls.push({ host, email, password });
-          return {
+          return Promise.resolve({
             token: "fresh-token",
             expiry: 4_102_444_800,
-          };
+          });
         },
       });
 

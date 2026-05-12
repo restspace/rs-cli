@@ -1,4 +1,4 @@
-import { Command } from "cliffy/command/mod.ts";
+import type { Command } from "cliffy/command/mod.ts";
 import { ApiClient, type ApiResponse } from "../lib/api-client.ts";
 import {
   loadConfig,
