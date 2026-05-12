@@ -6,6 +6,7 @@ export type RawRequestOptions = {
   body?: string | Uint8Array;
   timeoutMs?: number;
   token?: string;
+  throwOnNetworkError?: boolean;
 };
 
 export type RawResponse = {
@@ -38,6 +39,10 @@ function defaultContentType(body: string | Uint8Array): string {
   return "text/plain; charset=utf-8";
 }
 
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 export async function requestRaw(
   host: string,
   path: string,
@@ -59,32 +64,47 @@ export async function requestRaw(
     headers.set("content-type", defaultContentType(options.body));
   }
 
-  const controller = new AbortController();
-  const timeoutId = options.timeoutMs && options.timeoutMs > 0
-    ? setTimeout(() => controller.abort(), options.timeoutMs)
-    : undefined;
+  let lastError: unknown;
+  const maxAttempts = ["GET", "HEAD"].includes(method.toUpperCase()) ? 3 : 1;
 
-  try {
-    return await fetch(url.toString(), {
-      method,
-      headers,
-      body: options.body,
-      signal: controller.signal,
-    });
-  } catch (error) {
-    writeError({
-      error: error instanceof Error ? error.message : String(error),
-      suggestion: "Check network connectivity and the host URL.",
-    });
-    throw error;
-  } finally {
-    if (timeoutId) {
-      clearTimeout(timeoutId);
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    const controller = new AbortController();
+    const timeoutId = options.timeoutMs && options.timeoutMs > 0
+      ? setTimeout(() => controller.abort(), options.timeoutMs)
+      : undefined;
+
+    try {
+      return await fetch(url.toString(), {
+        method,
+        headers,
+        body: options.body,
+        signal: controller.signal,
+      });
+    } catch (error) {
+      lastError = error;
+      if (attempt < maxAttempts) {
+        await delay(100 * attempt);
+        continue;
+      }
+    } finally {
+      if (timeoutId) {
+        clearTimeout(timeoutId);
+      }
     }
   }
+
+  if (options.throwOnNetworkError) {
+    throw lastError;
+  }
+  writeError({
+    error: lastError instanceof Error ? lastError.message : String(lastError),
+    suggestion: "Check network connectivity and the host URL.",
+  });
 }
 
-export async function decodeRawResponse(response: Response): Promise<RawResponse> {
+export async function decodeRawResponse(
+  response: Response,
+): Promise<RawResponse> {
   const responseHeaders: Record<string, string> = {};
   for (const [key, value] of response.headers.entries()) {
     responseHeaders[key] = value;

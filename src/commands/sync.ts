@@ -526,11 +526,17 @@ async function listRemoteFiles(
     relativePath: string,
   ): Promise<RemoteFileMeta> {
     const filePath = siteFilePath(basePath, relativePath);
-    const headResponse = await requestRaw(host, filePath, "HEAD", {
-      token,
-      headers: MANAGE_HEADERS,
-    });
-    const response = headResponse.ok
+    let headResponse: Response | undefined;
+    try {
+      headResponse = await requestRaw(host, filePath, "HEAD", {
+        token,
+        headers: MANAGE_HEADERS,
+        throwOnNetworkError: true,
+      });
+    } catch {
+      headResponse = undefined;
+    }
+    const response = headResponse?.ok
       ? headResponse
       : await requestRaw(host, filePath, "GET", {
         token,

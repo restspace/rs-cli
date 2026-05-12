@@ -468,6 +468,100 @@ Deno.test("runSync treats nested service directories as sync boundaries", async 
   });
 });
 
+Deno.test("runSync falls back to GET when remote HEAD metadata probe fails", async () => {
+  await withTempHome(async () => {
+    await withTempDir(async (workspace) => {
+      await Deno.mkdir(join(workspace, "app"), { recursive: true });
+      const config = {
+        services: {
+          "/app": { name: "App" },
+        },
+      };
+      const serviceMetadata = {
+        services: {
+          "/app": { apis: ["store"] },
+        },
+      };
+      await Deno.writeTextFile(
+        join(workspace, "services.json"),
+        JSON.stringify(config, null, 2),
+      );
+
+      const calls: Array<{ url: string; method: string }> = [];
+      const fetchStub = stub(globalThis, "fetch", async (input, init) => {
+        const request = new Request(input, init);
+        calls.push({ url: request.url, method: request.method });
+        if (request.url.endsWith("/.well-known/restspace/raw")) {
+          return new Response(JSON.stringify(config), {
+            status: 200,
+            headers: {
+              "content-type": "application/json",
+              "last-modified": "Tue, 12 May 2026 10:00:00 GMT",
+            },
+          });
+        }
+        if (request.url.endsWith("/.well-known/restspace/services/raw")) {
+          return new Response(JSON.stringify(serviceMetadata), {
+            status: 200,
+            headers: {
+              "content-type": "application/json",
+              "last-modified": "Tue, 12 May 2026 10:00:00 GMT",
+            },
+          });
+        }
+        if (request.url.endsWith("/app/?$list=details")) {
+          return new Response(JSON.stringify(["index.html"]), {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          });
+        }
+        if (
+          request.method === "HEAD" &&
+          request.url.endsWith("/app/index.html")
+        ) {
+          throw new TypeError("connection closed before message completed");
+        }
+        if (
+          request.method === "GET" &&
+          request.url.endsWith("/app/index.html")
+        ) {
+          return new Response("remote", {
+            status: 200,
+            headers: {
+              "last-modified": "Tue, 12 May 2026 10:01:00 GMT",
+            },
+          });
+        }
+        return new Response("not found", { status: 404 });
+      });
+      const logStub = stub(console, "log", () => {});
+
+      try {
+        await runSync({ local: "add", yes: true }, workspace);
+        assertEquals(
+          await Deno.readTextFile(join(workspace, "app", "index.html")),
+          "remote",
+        );
+        assert(
+          calls.some((call) =>
+            call.method === "HEAD" &&
+            call.url === "https://tenant.restspace.io/app/index.html"
+          ),
+        );
+        assert(
+          calls.some((call) =>
+            call.method === "GET" &&
+            call.url === "https://tenant.restspace.io/app/index.html"
+          ),
+        );
+      } finally {
+        fetchStub.restore();
+        logStub.restore();
+      }
+    });
+  });
+});
+
 async function assertMissing(path: string): Promise<void> {
   try {
     await Deno.stat(path);
