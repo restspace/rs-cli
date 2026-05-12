@@ -2,6 +2,7 @@ import { Command } from "cliffy/command/mod.ts";
 import { registerAuthCommands } from "./commands/auth.ts";
 import { callCommand } from "./commands/call.ts";
 import { configCommand } from "./commands/config.ts";
+import { dataCommand } from "./commands/data.ts";
 import { discoverCommand } from "./commands/discover.ts";
 import { pipelineCommand } from "./commands/pipeline.ts";
 import { queryCommand } from "./commands/query.ts";
@@ -16,6 +17,7 @@ const app = new Command()
 app.command("config", configCommand());
 registerAuthCommands(app);
 app.command("call", callCommand());
+app.command("data", dataCommand());
 app.command("discover", discoverCommand());
 app.command("pipeline", pipelineCommand());
 app.command("send", sendCommand());
