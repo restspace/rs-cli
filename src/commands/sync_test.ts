@@ -204,6 +204,24 @@ Deno.test("runSync --init writes services.json and creates store service directo
           method: request.method,
           cookie: request.headers.get("cookie"),
         });
+        if (request.url.endsWith("/.well-known/restspace/raw")) {
+          return new Response(
+            JSON.stringify({
+              services: {
+                "/app": { source: "config" },
+                "/api/v1": { source: "config" },
+                "/plain": { source: "config" },
+              },
+            }),
+            {
+              status: 200,
+              headers: {
+                "content-type": "application/json",
+                "last-modified": "Tue, 12 May 2026 10:00:00 GMT",
+              },
+            },
+          );
+        }
         return new Response(
           JSON.stringify({
             services: {
@@ -226,15 +244,23 @@ Deno.test("runSync --init writes services.json and creates store service directo
       try {
         await runSync({ init: true }, workspace);
         const raw = await Deno.readTextFile(join(workspace, "services.json"));
-        assertEquals(JSON.parse(raw).services["/app"].apis, ["store"]);
+        assertEquals(JSON.parse(raw).services["/app"], { source: "config" });
         assert((await Deno.stat(join(workspace, "app"))).isDirectory);
         assert((await Deno.stat(join(workspace, "api", "v1"))).isDirectory);
         await assertMissing(join(workspace, "plain"));
-        assertEquals(calls, [{
-          url: "https://tenant.restspace.io/.well-known/restspace/raw",
-          method: "GET",
-          cookie: "rs-auth=test-token",
-        }]);
+        assertEquals(calls, [
+          {
+            url: "https://tenant.restspace.io/.well-known/restspace/raw",
+            method: "GET",
+            cookie: "rs-auth=test-token",
+          },
+          {
+            url:
+              "https://tenant.restspace.io/.well-known/restspace/services/raw",
+            method: "GET",
+            cookie: "rs-auth=test-token",
+          },
+        ]);
       } finally {
         fetchStub.restore();
         logStub.restore();

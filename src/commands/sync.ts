@@ -9,6 +9,7 @@ const SYNC_FILE_NAME = ".rs-sync";
 const SYNC_STATE_FILE_NAME = ".rs-sync-state.json";
 const SERVICES_FILE_NAME = "services.json";
 const RAW_CONFIG_PATH = "/.well-known/restspace/raw";
+const SERVICES_RAW_CONFIG_PATH = "/.well-known/restspace/services/raw";
 const ADMIN_BASE_PATH = "/.well-known/restspace";
 const CLOCK_SKEW_WINDOW_MS = 60_000;
 const MANAGE_HEADERS = { "X-Restspace-Request-Mode": "manage" };
@@ -422,8 +423,9 @@ async function readJsonFile(path: string): Promise<unknown> {
 async function fetchRemoteConfig(
   host: string,
   token: string | undefined,
+  path = RAW_CONFIG_PATH,
 ): Promise<{ json: unknown; meta: RemoteFileMeta; text: string }> {
-  const response = await requestRaw(host, RAW_CONFIG_PATH, "GET", {
+  const response = await requestRaw(host, path, "GET", {
     token,
     headers: MANAGE_HEADERS,
   });
@@ -432,7 +434,7 @@ async function fetchRemoteConfig(
     writeError({
       status: response.status,
       error: "Failed to fetch tenant services config.",
-      suggestion: "Check manage permissions for /.well-known/restspace/raw.",
+      suggestion: `Check manage permissions for ${path}.`,
       details: text,
     });
   }
@@ -1286,10 +1288,15 @@ async function runSyncInit(
   const host = resolveHost(config.host);
   const token = config.auth?.token;
   const remoteConfig = await fetchRemoteConfig(host, token);
+  const serviceMetadata = await fetchRemoteConfig(
+    host,
+    token,
+    SERVICES_RAW_CONFIG_PATH,
+  );
   await Deno.writeTextFile(servicesPath, prettyJson(remoteConfig.json));
 
   const directories: string[] = [];
-  for (const service of extractStoreCapableServices(remoteConfig.json)) {
+  for (const service of extractStoreCapableServices(serviceMetadata.json)) {
     const relativePath = serviceBasePathToRelativePath(service.basePath);
     await Deno.mkdir(serviceBasePathToLocalPath(localRoot, service.basePath), {
       recursive: true,
