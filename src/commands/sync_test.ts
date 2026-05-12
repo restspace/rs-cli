@@ -347,6 +347,96 @@ Deno.test("runSync multi-service skips missing service directories", async () =>
   });
 });
 
+Deno.test("runSync treats nested service directories as sync boundaries", async () => {
+  await withTempHome(async () => {
+    await withTempDir(async (workspace) => {
+      await Deno.mkdir(join(workspace, "spec", "data"), { recursive: true });
+      await Deno.writeTextFile(
+        join(workspace, "spec", "parent-local.txt"),
+        "parent",
+      );
+      await Deno.writeTextFile(
+        join(workspace, "spec", "data", "child-local.txt"),
+        "child",
+      );
+      const config = {
+        services: {
+          "/spec": { apis: ["store"] },
+          "/spec/data": { apis: ["store"] },
+        },
+      };
+      await Deno.writeTextFile(
+        join(workspace, "services.json"),
+        JSON.stringify(config, null, 2),
+      );
+
+      const calls: Array<{ url: string; method: string }> = [];
+      const fetchStub = stub(globalThis, "fetch", async (input, init) => {
+        const request = new Request(input, init);
+        calls.push({ url: request.url, method: request.method });
+        if (request.url.endsWith("/.well-known/restspace/raw")) {
+          return new Response(JSON.stringify(config), {
+            status: 200,
+            headers: {
+              "content-type": "application/json",
+              "last-modified": "Tue, 12 May 2026 10:00:00 GMT",
+            },
+          });
+        }
+        if (request.method === "PUT") {
+          return new Response(null, { status: 204 });
+        }
+        if (request.url.endsWith("/spec/?$list=details")) {
+          return new Response(JSON.stringify(["data/"]), {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          });
+        }
+        if (request.url.endsWith("/spec/data/?$list=details")) {
+          return new Response("[]", {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          });
+        }
+        return new Response("[]", {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      });
+      const logStub = stub(console, "log", () => {});
+
+      try {
+        await runSync({ remote: "add", yes: true }, workspace);
+        assertEquals(
+          calls.filter((call) =>
+            call.method === "PUT" &&
+            call.url === "https://tenant.restspace.io/spec/parent-local.txt"
+          ).length,
+          1,
+        );
+        assertEquals(
+          calls.filter((call) =>
+            call.method === "PUT" &&
+            call.url ===
+              "https://tenant.restspace.io/spec/data/child-local.txt"
+          ).length,
+          1,
+        );
+        assertEquals(
+          calls.filter((call) =>
+            call.url ===
+              "https://tenant.restspace.io/spec/data/?$list=details"
+          ).length,
+          2,
+        );
+      } finally {
+        fetchStub.restore();
+        logStub.restore();
+      }
+    });
+  });
+});
+
 async function assertMissing(path: string): Promise<void> {
   try {
     await Deno.stat(path);

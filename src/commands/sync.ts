@@ -466,12 +466,55 @@ function workspaceStateKey(basePath: string, relativePath: string): string {
   return JSON.stringify({ basePath, relativePath });
 }
 
+function normalizeExcludedPrefixes(prefixes?: string[]): string[] {
+  if (!prefixes?.length) {
+    return [];
+  }
+  return [...new Set(prefixes.map(toRelativeKey).filter(Boolean))]
+    .sort((left, right) => left.localeCompare(right));
+}
+
+function isExcludedByPrefix(path: string, prefixes: string[]): boolean {
+  const key = toRelativeKey(path);
+  return prefixes.some((prefix) =>
+    key === prefix || key.startsWith(`${prefix}/`)
+  );
+}
+
+function isChildServicePath(
+  parentBasePath: string,
+  childBasePath: string,
+): boolean {
+  if (parentBasePath === childBasePath) {
+    return false;
+  }
+  if (parentBasePath === "/") {
+    return childBasePath !== "/";
+  }
+  return childBasePath.startsWith(`${parentBasePath}/`);
+}
+
+function childServiceExclusionPrefixes(
+  basePath: string,
+  services: ServiceSyncTarget[],
+): string[] {
+  const prefixes = services
+    .filter((service) => isChildServicePath(basePath, service.basePath))
+    .map((service) =>
+      basePath === "/"
+        ? service.basePath.replace(/^\/+/, "")
+        : service.basePath.slice(basePath.length).replace(/^\/+/, "")
+    );
+  return normalizeExcludedPrefixes(prefixes);
+}
+
 async function listRemoteFiles(
   host: string,
   token: string | undefined,
   basePath: string,
-  options: { failFast?: boolean } = {},
+  options: { failFast?: boolean; excludePrefixes?: string[] } = {},
 ): Promise<Map<string, RemoteFileMeta>> {
+  const excludedPrefixes = normalizeExcludedPrefixes(options.excludePrefixes);
   function remoteListError(payload: Record<string, unknown>): never {
     if (options.failFast === false) {
       throw new Error(JSON.stringify(payload));
@@ -614,6 +657,9 @@ async function listRemoteFiles(
         const childPrefix = current.prefix
           ? `${current.prefix}/${childName}`
           : childName;
+        if (isExcludedByPrefix(childPrefix, excludedPrefixes)) {
+          continue;
+        }
         const childDirectoryPath = siteFilePath(basePath, childPrefix);
         stack.push({ directoryPath: childDirectoryPath, prefix: childPrefix });
         continue;
@@ -623,7 +669,9 @@ async function listRemoteFiles(
         ? `${current.prefix}/${rawName}`
         : rawName;
       const key = toRelativeKey(relativeName);
-      if (!key || isSyncMarker(key)) {
+      if (
+        !key || isSyncMarker(key) || isExcludedByPrefix(key, excludedPrefixes)
+      ) {
         continue;
       }
       let metadata: RemoteFileMeta;
@@ -640,7 +688,9 @@ async function listRemoteFiles(
 
 async function listLocalFiles(
   rootPath: string,
+  options: { excludePrefixes?: string[] } = {},
 ): Promise<Map<string, LocalFileMeta>> {
+  const excludedPrefixes = normalizeExcludedPrefixes(options.excludePrefixes);
   const result = new Map<string, LocalFileMeta>();
   const stack = [rootPath];
   while (stack.length > 0) {
@@ -650,6 +700,10 @@ async function listLocalFiles(
     }
     for await (const entry of Deno.readDir(current)) {
       const absolutePath = join(current, entry.name);
+      const relativePath = toRelativeKey(relative(rootPath, absolutePath));
+      if (relativePath && isExcludedByPrefix(relativePath, excludedPrefixes)) {
+        continue;
+      }
       if (entry.isDirectory) {
         stack.push(absolutePath);
         continue;
@@ -657,7 +711,6 @@ async function listLocalFiles(
       if (!entry.isFile) {
         continue;
       }
-      const relativePath = toRelativeKey(relative(rootPath, absolutePath));
       if (!relativePath || isSyncMarker(relativePath)) {
         continue;
       }
@@ -1544,9 +1597,16 @@ async function runMultiServiceSync(
     }
 
     try {
+      const excludePrefixes = childServiceExclusionPrefixes(
+        service.basePath,
+        services,
+      );
       const [localFiles, remoteFiles] = await Promise.all([
-        listLocalFiles(serviceRoot),
-        listRemoteFiles(host, token, service.basePath, { failFast: false }),
+        listLocalFiles(serviceRoot, { excludePrefixes }),
+        listRemoteFiles(host, token, service.basePath, {
+          failFast: false,
+          excludePrefixes,
+        }),
       ]);
       const { actions, stats: serviceStats } = await planActions(
         localFiles,
@@ -1664,9 +1724,16 @@ async function runMultiServiceSync(
 
   const refreshedServices = [];
   for (const service of servicePlans) {
+    const excludePrefixes = childServiceExclusionPrefixes(
+      service.basePath,
+      services,
+    );
     const [localFiles, remoteFiles] = await Promise.all([
-      listLocalFiles(service.localRoot),
-      listRemoteFiles(host, token, service.basePath, { failFast: false }),
+      listLocalFiles(service.localRoot, { excludePrefixes }),
+      listRemoteFiles(host, token, service.basePath, {
+        failFast: false,
+        excludePrefixes,
+      }),
     ]);
     refreshedServices.push({
       basePath: service.basePath,
