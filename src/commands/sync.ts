@@ -7,6 +7,9 @@ import { loadAuthReadyConfig } from "../lib/runtime-config.ts";
 
 const SYNC_FILE_NAME = ".rs-sync";
 const SYNC_STATE_FILE_NAME = ".rs-sync-state.json";
+const SERVICES_FILE_NAME = "services.json";
+const RAW_CONFIG_PATH = "/.well-known/restspace/raw";
+const ADMIN_BASE_PATH = "/.well-known/restspace";
 const CLOCK_SKEW_WINDOW_MS = 60_000;
 const MANAGE_HEADERS = { "X-Restspace-Request-Mode": "manage" };
 
@@ -43,6 +46,11 @@ type RemoteFileMeta = {
   etag?: string;
 };
 
+type ServiceSyncTarget = {
+  basePath: string;
+  service: Record<string, unknown>;
+};
+
 type SyncStateEntry = {
   localMtimeMs: number;
   remoteMtimeMs: number;
@@ -54,6 +62,34 @@ type SyncStateFile = {
   version: 1;
   siteRelativeUrl: string;
   files: Record<string, SyncStateEntry>;
+};
+
+type WorkspaceStateEntry = {
+  basePath: string;
+  relativePath: string;
+  entry: SyncStateEntry;
+};
+
+type WorkspaceStateFile = {
+  version: 2;
+  config?: SyncStateEntry;
+  files: WorkspaceStateEntry[];
+};
+
+type WorkspaceState = {
+  config?: SyncStateEntry;
+  files: Map<string, SyncStateEntry>;
+};
+
+type ConfigServiceDiff = {
+  added: string[];
+  removed: string[];
+  changed: string[];
+};
+
+type ConfigSyncAction = {
+  direction: "upload" | "download";
+  services: ConfigServiceDiff;
 };
 
 type SyncPlanSummary = {
@@ -182,11 +218,261 @@ function extractErrorMessage(payload: unknown): string | undefined {
   return undefined;
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return !!value && typeof value === "object" && !Array.isArray(value);
+}
+
+function normalizeJsonValue(value: unknown): unknown {
+  if (Array.isArray(value)) {
+    return value.map(normalizeJsonValue);
+  }
+  if (!isRecord(value)) {
+    return value;
+  }
+  const result: Record<string, unknown> = {};
+  for (const key of Object.keys(value).sort()) {
+    result[key] = normalizeJsonValue(value[key]);
+  }
+  return result;
+}
+
+export function normalizeServiceJson(value: unknown): string {
+  return JSON.stringify(normalizeJsonValue(value));
+}
+
+function prettyJson(value: unknown): string {
+  return `${JSON.stringify(normalizeJsonValue(value), null, 2)}\n`;
+}
+
+function extractServicesSource(config: unknown): unknown {
+  if (!isRecord(config)) {
+    return undefined;
+  }
+  return "services" in config ? config.services : config;
+}
+
+function extractServicesMap(config: unknown): Record<string, unknown> {
+  const services = extractServicesSource(config);
+  if (isRecord(services)) {
+    return services;
+  }
+  if (!Array.isArray(services)) {
+    return {};
+  }
+  const result: Record<string, unknown> = {};
+  for (const service of services) {
+    if (!isRecord(service) || typeof service.basePath !== "string") {
+      continue;
+    }
+    result[service.basePath] = service;
+  }
+  return result;
+}
+
+export function validateServiceBasePath(basePath: string):
+  | { ok: true; basePath: string }
+  | { ok: false; reason: string } {
+  const trimmed = basePath.trim();
+  if (!trimmed || !trimmed.startsWith("/")) {
+    return { ok: false, reason: "must start with /" };
+  }
+  const normalized = trimmed.replace(/\/+$/, "") || "/";
+  const segments = normalized.split("/").slice(1);
+  if (normalized === "/") {
+    return { ok: false, reason: "root is not allowed" };
+  }
+  if (
+    segments.some((segment) => !segment || segment === "." || segment === "..")
+  ) {
+    return { ok: false, reason: "path traversal is not allowed" };
+  }
+  if (
+    normalized === ADMIN_BASE_PATH ||
+    normalized.startsWith(`${ADMIN_BASE_PATH}/`)
+  ) {
+    return { ok: false, reason: "admin service paths are not allowed" };
+  }
+  return { ok: true, basePath: normalized };
+}
+
+function normalizeServiceBasePath(basePath: string): string {
+  const validation = validateServiceBasePath(basePath);
+  if (!validation.ok) {
+    writeError({
+      error: `Invalid service base path '${basePath}'.`,
+      suggestion:
+        "Use a non-root service path outside /.well-known/restspace without traversal.",
+      details: validation.reason,
+    });
+  }
+  return validation.basePath;
+}
+
+export function serviceBasePathToRelativePath(basePath: string): string {
+  return normalizeServiceBasePath(basePath).replace(/^\/+/, "");
+}
+
+function serviceBasePathToLocalPath(
+  rootPath: string,
+  basePath: string,
+): string {
+  return join(rootPath, ...serviceBasePathToRelativePath(basePath).split("/"));
+}
+
+function readServiceBasePath(
+  key: string,
+  service: Record<string, unknown>,
+): string | undefined {
+  if (key.trim()) {
+    return key;
+  }
+  return typeof service.basePath === "string" ? service.basePath : undefined;
+}
+
+function serviceHasStoreApi(service: Record<string, unknown>): boolean {
+  if (!Array.isArray(service.apis)) {
+    return false;
+  }
+  return service.apis.some((api) =>
+    typeof api === "string" && (api === "store" || api.startsWith("store-"))
+  );
+}
+
+export function extractStoreCapableServices(
+  config: unknown,
+): ServiceSyncTarget[] {
+  const services = extractServicesMap(config);
+  const result: ServiceSyncTarget[] = [];
+  for (const [key, value] of Object.entries(services)) {
+    if (!isRecord(value)) {
+      continue;
+    }
+    if (!serviceHasStoreApi(value)) {
+      continue;
+    }
+    const basePath = readServiceBasePath(key, value);
+    if (!basePath) {
+      continue;
+    }
+    result.push({
+      basePath: normalizeServiceBasePath(basePath),
+      service: value,
+    });
+  }
+  result.sort((left, right) => left.basePath.localeCompare(right.basePath));
+  return result;
+}
+
+export function diffConfigServices(
+  sourceConfig: unknown,
+  targetConfig: unknown,
+): ConfigServiceDiff {
+  const source = extractServicesMap(sourceConfig);
+  const target = extractServicesMap(targetConfig);
+  const added: string[] = [];
+  const removed: string[] = [];
+  const changed: string[] = [];
+
+  for (const basePath of Object.keys(source).sort()) {
+    if (!(basePath in target)) {
+      added.push(basePath);
+      continue;
+    }
+    if (
+      normalizeServiceJson(source[basePath]) !==
+        normalizeServiceJson(target[basePath])
+    ) {
+      changed.push(basePath);
+    }
+  }
+  for (const basePath of Object.keys(target).sort()) {
+    if (!(basePath in source)) {
+      removed.push(basePath);
+    }
+  }
+
+  return { added, removed, changed };
+}
+
+function parseRemoteTimestamp(response: Response): number {
+  const value = response.headers.get("last-modified") ??
+    response.headers.get("date");
+  if (value) {
+    const parsed = Date.parse(value);
+    if (Number.isFinite(parsed)) {
+      return Math.trunc(parsed);
+    }
+  }
+  return Date.now();
+}
+
+async function readJsonFile(path: string): Promise<unknown> {
+  const raw = await Deno.readTextFile(path);
+  try {
+    return JSON.parse(raw);
+  } catch (error) {
+    writeError({
+      error: `Failed to parse JSON file '${path}'.`,
+      suggestion: "Fix the JSON syntax and retry.",
+      details: error instanceof Error ? error.message : String(error),
+    });
+  }
+}
+
+async function fetchRemoteConfig(
+  host: string,
+  token: string | undefined,
+): Promise<{ json: unknown; meta: RemoteFileMeta; text: string }> {
+  const response = await requestRaw(host, RAW_CONFIG_PATH, "GET", {
+    token,
+    headers: MANAGE_HEADERS,
+  });
+  const text = await response.text();
+  if (!response.ok) {
+    writeError({
+      status: response.status,
+      error: "Failed to fetch tenant services config.",
+      suggestion: "Check manage permissions for /.well-known/restspace/raw.",
+      details: text,
+    });
+  }
+  let json: unknown;
+  try {
+    json = JSON.parse(text);
+  } catch (error) {
+    writeError({
+      error: "Remote services config was not valid JSON.",
+      suggestion: "Fix the tenant raw services config before syncing.",
+      details: error instanceof Error ? error.message : String(error),
+    });
+  }
+  return {
+    json,
+    text,
+    meta: {
+      mtimeMs: parseRemoteTimestamp(response),
+      etag: response.headers.get("etag") ?? undefined,
+    },
+  };
+}
+
+function workspaceStateKey(basePath: string, relativePath: string): string {
+  return JSON.stringify({ basePath, relativePath });
+}
+
 async function listRemoteFiles(
   host: string,
   token: string | undefined,
   basePath: string,
+  options: { failFast?: boolean } = {},
 ): Promise<Map<string, RemoteFileMeta>> {
+  function remoteListError(payload: Record<string, unknown>): never {
+    if (options.failFast === false) {
+      throw new Error(JSON.stringify(payload));
+    }
+    writeError(payload);
+  }
+
   async function fetchRemoteFileMeta(
     relativePath: string,
   ): Promise<RemoteFileMeta> {
@@ -203,7 +489,7 @@ async function listRemoteFiles(
       });
     if (!response.ok) {
       const text = await response.text();
-      writeError({
+      remoteListError({
         status: response.status,
         error: `Failed to read timestamp for remote file '${relativePath}'.`,
         suggestion: "Check remote file permissions.",
@@ -212,7 +498,7 @@ async function listRemoteFiles(
     }
     const lastModified = response.headers.get("last-modified");
     if (!lastModified) {
-      writeError({
+      remoteListError({
         error: `Remote file '${relativePath}' has no Last-Modified header.`,
         suggestion:
           "Ensure the service returns Last-Modified for file resources.",
@@ -220,7 +506,7 @@ async function listRemoteFiles(
     }
     const parsed = Date.parse(lastModified);
     if (!Number.isFinite(parsed)) {
-      writeError({
+      remoteListError({
         error:
           `Could not parse Last-Modified for remote file '${relativePath}'.`,
         suggestion: "Ensure Last-Modified is a valid HTTP date.",
@@ -244,7 +530,7 @@ async function listRemoteFiles(
     });
     if (!response.ok) {
       const text = await response.text();
-      writeError({
+      remoteListError({
         status: response.status,
         error: extractErrorMessage(text) ??
           `Failed to list remote directory at ${directoryPath}.`,
@@ -257,7 +543,7 @@ async function listRemoteFiles(
     try {
       payload = await response.json();
     } catch {
-      writeError({
+      remoteListError({
         error: "Remote directory listing response was not valid JSON.",
         suggestion: "Verify the endpoint supports ?$list=details.",
       });
@@ -271,7 +557,7 @@ async function listRemoteFiles(
     ) {
       return (payload as { paths: unknown[] }).paths;
     }
-    writeError({
+    remoteListError({
       error: "Remote directory listing did not return an array of entries.",
       suggestion:
         "Expected tuples in the response or an object containing a paths array.",
@@ -302,7 +588,7 @@ async function listRemoteFiles(
           entryTimestamp = Math.trunc(entry[1]);
         }
       } else {
-        writeError({
+        remoteListError({
           error: "Invalid directory entry returned by server.",
           suggestion:
             "Expected entries as names or [name, dateModified] tuples.",
@@ -787,8 +1073,610 @@ async function writeSyncState(
   await Deno.writeTextFile(statePath, JSON.stringify(payload, null, 2));
 }
 
+async function readWorkspaceState(rootPath: string): Promise<WorkspaceState> {
+  const statePath = join(rootPath, SYNC_STATE_FILE_NAME);
+  const empty = {
+    files: new Map<string, SyncStateEntry>(),
+  };
+  try {
+    const raw = await Deno.readTextFile(statePath);
+    if (!raw.trim()) {
+      return empty;
+    }
+    const parsed = JSON.parse(raw) as Partial<WorkspaceStateFile>;
+    if (parsed.version !== 2 || !Array.isArray(parsed.files)) {
+      return empty;
+    }
+    const files = new Map<string, SyncStateEntry>();
+    for (const value of parsed.files) {
+      if (!value || typeof value !== "object") {
+        continue;
+      }
+      const record = value as Partial<WorkspaceStateEntry>;
+      const entry = record.entry as Partial<SyncStateEntry> | undefined;
+      if (
+        typeof record.basePath !== "string" ||
+        typeof record.relativePath !== "string" ||
+        !entry ||
+        typeof entry.localMtimeMs !== "number" ||
+        typeof entry.remoteMtimeMs !== "number"
+      ) {
+        continue;
+      }
+      files.set(workspaceStateKey(record.basePath, record.relativePath), {
+        localMtimeMs: Math.trunc(entry.localMtimeMs),
+        remoteMtimeMs: Math.trunc(entry.remoteMtimeMs),
+        remoteEtag: typeof entry.remoteEtag === "string"
+          ? entry.remoteEtag
+          : undefined,
+        localHash: typeof entry.localHash === "string"
+          ? entry.localHash
+          : undefined,
+      });
+    }
+    const config = parsed.config &&
+        typeof parsed.config.localMtimeMs === "number" &&
+        typeof parsed.config.remoteMtimeMs === "number"
+      ? {
+        localMtimeMs: Math.trunc(parsed.config.localMtimeMs),
+        remoteMtimeMs: Math.trunc(parsed.config.remoteMtimeMs),
+        remoteEtag: typeof parsed.config.remoteEtag === "string"
+          ? parsed.config.remoteEtag
+          : undefined,
+        localHash: typeof parsed.config.localHash === "string"
+          ? parsed.config.localHash
+          : undefined,
+      }
+      : undefined;
+    return { config, files };
+  } catch (error) {
+    if (error instanceof Deno.errors.NotFound) {
+      return empty;
+    }
+    return empty;
+  }
+}
+
+function serviceStateFiles(
+  state: WorkspaceState,
+  basePath: string,
+): Map<string, SyncStateEntry> {
+  const result = new Map<string, SyncStateEntry>();
+  for (const [key, entry] of state.files.entries()) {
+    const parsed = JSON.parse(key) as {
+      basePath?: unknown;
+      relativePath?: unknown;
+    };
+    if (
+      parsed.basePath === basePath &&
+      typeof parsed.relativePath === "string"
+    ) {
+      result.set(parsed.relativePath, entry);
+    }
+  }
+  return result;
+}
+
+async function writeWorkspaceState(
+  rootPath: string,
+  configState: SyncStateEntry | undefined,
+  services: Array<{
+    basePath: string;
+    localRoot: string;
+    localFiles: Map<string, LocalFileMeta>;
+    remoteFiles: Map<string, RemoteFileMeta>;
+  }>,
+): Promise<void> {
+  const files: WorkspaceStateEntry[] = [];
+  for (const service of services) {
+    for (const [relativePath, localMeta] of service.localFiles.entries()) {
+      const remoteMeta = service.remoteFiles.get(relativePath);
+      if (!remoteMeta) {
+        continue;
+      }
+      files.push({
+        basePath: service.basePath,
+        relativePath,
+        entry: {
+          localMtimeMs: localMeta.mtimeMs,
+          remoteMtimeMs: remoteMeta.mtimeMs,
+          remoteEtag: remoteMeta.etag,
+          localHash: await hashLocalFile(service.localRoot, relativePath),
+        },
+      });
+    }
+  }
+  files.sort((left, right) =>
+    left.basePath.localeCompare(right.basePath) ||
+    left.relativePath.localeCompare(right.relativePath)
+  );
+  const payload: WorkspaceStateFile = {
+    version: 2,
+    config: configState,
+    files,
+  };
+  const statePath = join(rootPath, SYNC_STATE_FILE_NAME);
+  await Deno.writeTextFile(statePath, JSON.stringify(payload, null, 2));
+}
+
+async function buildConfigState(
+  rootPath: string,
+  remoteMeta: RemoteFileMeta,
+): Promise<SyncStateEntry> {
+  const configPath = join(rootPath, SERVICES_FILE_NAME);
+  const localInfo = await Deno.stat(configPath);
+  return {
+    localMtimeMs: Math.trunc(localInfo.mtime?.getTime() ?? Date.now()),
+    remoteMtimeMs: remoteMeta.mtimeMs,
+    remoteEtag: remoteMeta.etag,
+    localHash: await hashLocalFile(rootPath, SERVICES_FILE_NAME),
+  };
+}
+
 export const SYNC_DESCRIPTION =
   "Sync a local directory with a remote Restspace directory (previews changes and asks for confirmation unless --yes is provided).";
+
+async function ensureInitRoot(
+  localRoot: string,
+  inputPath: string,
+): Promise<void> {
+  try {
+    const stat = await Deno.stat(localRoot);
+    if (!stat.isDirectory) {
+      writeError({
+        error: `Local path '${inputPath}' is not a directory.`,
+        suggestion: "Provide a directory path to initialize.",
+      });
+    }
+  } catch (error) {
+    if (error instanceof Deno.errors.NotFound) {
+      await Deno.mkdir(localRoot, { recursive: true });
+      return;
+    }
+    throw error;
+  }
+}
+
+async function servicesFileExists(localRoot: string): Promise<boolean> {
+  try {
+    const stat = await Deno.stat(join(localRoot, SERVICES_FILE_NAME));
+    return stat.isFile;
+  } catch (error) {
+    if (error instanceof Deno.errors.NotFound) {
+      return false;
+    }
+    throw error;
+  }
+}
+
+async function servicesPathExists(localRoot: string): Promise<boolean> {
+  try {
+    await Deno.stat(join(localRoot, SERVICES_FILE_NAME));
+    return true;
+  } catch (error) {
+    if (error instanceof Deno.errors.NotFound) {
+      return false;
+    }
+    throw error;
+  }
+}
+
+async function runSyncInit(
+  path: string,
+  siteRelativeUrl: string | undefined,
+): Promise<void> {
+  if (siteRelativeUrl?.trim()) {
+    writeError({
+      error: "--init does not accept a siteRelativeUrl.",
+      suggestion: "Run `rs sync <path> --init` for workspace initialization.",
+    });
+  }
+
+  const localRoot = resolve(path);
+  await ensureInitRoot(localRoot, path);
+  const servicesPath = join(localRoot, SERVICES_FILE_NAME);
+  if (await servicesPathExists(localRoot)) {
+    writeError({
+      error: `${SERVICES_FILE_NAME} already exists.`,
+      suggestion: "Use the existing workspace or choose an empty path.",
+    });
+  }
+
+  const config = await loadAuthReadyConfig();
+  const host = resolveHost(config.host);
+  const token = config.auth?.token;
+  const remoteConfig = await fetchRemoteConfig(host, token);
+  await Deno.writeTextFile(servicesPath, prettyJson(remoteConfig.json));
+
+  const directories: string[] = [];
+  for (const service of extractStoreCapableServices(remoteConfig.json)) {
+    const relativePath = serviceBasePathToRelativePath(service.basePath);
+    await Deno.mkdir(serviceBasePathToLocalPath(localRoot, service.basePath), {
+      recursive: true,
+    });
+    directories.push(relativePath);
+  }
+
+  writeSuccess({
+    initialized: true,
+    path: localRoot,
+    servicesJson: servicesPath,
+    directories,
+  });
+}
+
+async function planConfigSync(
+  rootPath: string,
+  host: string,
+  token: string | undefined,
+  state: SyncStateEntry | undefined,
+): Promise<{
+  localJson: unknown;
+  remoteJson: unknown;
+  remoteMeta: RemoteFileMeta;
+  action?: ConfigSyncAction;
+}> {
+  const localJson = await readJsonFile(join(rootPath, SERVICES_FILE_NAME));
+  const remoteConfig = await fetchRemoteConfig(host, token);
+  const localNormalized = normalizeServiceJson(localJson);
+  const remoteNormalized = normalizeServiceJson(remoteConfig.json);
+  if (localNormalized === remoteNormalized) {
+    return {
+      localJson,
+      remoteJson: remoteConfig.json,
+      remoteMeta: remoteConfig.meta,
+    };
+  }
+
+  const localInfo = await Deno.stat(join(rootPath, SERVICES_FILE_NAME));
+  const localMeta = {
+    mtimeMs: Math.trunc(localInfo.mtime?.getTime() ?? Date.now()),
+  };
+  let localChanged = hasLocalChanged(localMeta, state);
+  if (localChanged && state?.localHash) {
+    const currentHash = await hashLocalFile(rootPath, SERVICES_FILE_NAME);
+    if (currentHash === state.localHash) {
+      localChanged = false;
+    }
+  }
+  const remoteChanged = hasRemoteChanged(remoteConfig.meta, state);
+
+  let direction: "upload" | "download";
+  if (localChanged && !remoteChanged) {
+    direction = "upload";
+  } else if (!localChanged && remoteChanged) {
+    direction = "download";
+  } else {
+    direction = localMeta.mtimeMs >= remoteConfig.meta.mtimeMs
+      ? "upload"
+      : "download";
+  }
+
+  const services = direction === "upload"
+    ? diffConfigServices(localJson, remoteConfig.json)
+    : diffConfigServices(remoteConfig.json, localJson);
+
+  return {
+    localJson,
+    remoteJson: remoteConfig.json,
+    remoteMeta: remoteConfig.meta,
+    action: { direction, services },
+  };
+}
+
+async function applyConfigSync(
+  rootPath: string,
+  host: string,
+  token: string | undefined,
+  plan: Awaited<ReturnType<typeof planConfigSync>>,
+): Promise<RemoteFileMeta> {
+  if (!plan.action) {
+    return plan.remoteMeta;
+  }
+
+  if (plan.action.direction === "download") {
+    await Deno.writeTextFile(
+      join(rootPath, SERVICES_FILE_NAME),
+      prettyJson(plan.remoteJson),
+    );
+    const when = new Date(plan.remoteMeta.mtimeMs);
+    await Deno.utime(join(rootPath, SERVICES_FILE_NAME), when, when);
+    return plan.remoteMeta;
+  }
+
+  const body = prettyJson(plan.localJson);
+  const response = await requestRaw(host, RAW_CONFIG_PATH, "PUT", {
+    token,
+    body,
+    headers: {
+      ...MANAGE_HEADERS,
+      "content-type": "application/json; charset=utf-8",
+    },
+  });
+  const text = await response.text();
+  if (!response.ok) {
+    writeError({
+      status: response.status,
+      error: "Failed to upload tenant services config.",
+      suggestion: "Check manage permissions for /.well-known/restspace/raw.",
+      details: text,
+    });
+  }
+  await Deno.writeTextFile(join(rootPath, SERVICES_FILE_NAME), body);
+  return (await fetchRemoteConfig(host, token)).meta;
+}
+
+function emptyStats(): SyncStats {
+  return {
+    localFiles: 0,
+    remoteFiles: 0,
+    uploaded: 0,
+    downloaded: 0,
+    deletedLocal: 0,
+    deletedRemote: 0,
+    ignored: 0,
+    noChange: 0,
+    failed: 0,
+  };
+}
+
+function addStats(target: SyncStats, source: SyncStats): void {
+  target.localFiles += source.localFiles;
+  target.remoteFiles += source.remoteFiles;
+  target.uploaded += source.uploaded;
+  target.downloaded += source.downloaded;
+  target.deletedLocal += source.deletedLocal;
+  target.deletedRemote += source.deletedRemote;
+  target.ignored += source.ignored;
+  target.noChange += source.noChange;
+  target.failed += source.failed;
+}
+
+async function runMultiServiceSync(
+  options: {
+    local?: string | string[];
+    remote?: string | string[];
+    yes?: boolean;
+    verbose?: boolean;
+  },
+  localRoot: string,
+): Promise<void> {
+  const localModes = parseModes("local", options.local);
+  const remoteModes = parseModes("remote", options.remote);
+
+  const config = await loadAuthReadyConfig();
+  const host = resolveHost(config.host);
+  const token = config.auth?.token;
+  const workspaceState = await readWorkspaceState(localRoot);
+
+  const configPlan = await planConfigSync(
+    localRoot,
+    host,
+    token,
+    workspaceState.config,
+  );
+  if (configPlan.action) {
+    writeSuccess({
+      preview: true,
+      path: localRoot,
+      config: configPlan.action,
+    });
+    if (!options.yes) {
+      let approved = false;
+      try {
+        approved = confirm("Proceed with services.json sync changes? [y/N]");
+      } catch {
+        writeError({
+          error: "Unable to read interactive confirmation.",
+          suggestion: "Run with -y or --yes to bypass confirmation.",
+        });
+      }
+      if (!approved) {
+        writeSuccess({
+          path: localRoot,
+          config: configPlan.action,
+          aborted: true,
+        });
+        return;
+      }
+    }
+  }
+
+  const remoteConfigMeta = await applyConfigSync(
+    localRoot,
+    host,
+    token,
+    configPlan,
+  );
+  const configState = await buildConfigState(localRoot, remoteConfigMeta);
+  const workspaceConfig = await readJsonFile(
+    join(localRoot, SERVICES_FILE_NAME),
+  );
+  const services = extractStoreCapableServices(workspaceConfig);
+
+  const servicePlans: Array<{
+    basePath: string;
+    localRoot: string;
+    localFiles: Map<string, LocalFileMeta>;
+    remoteFiles: Map<string, RemoteFileMeta>;
+    actions: SyncAction[];
+    stats: SyncStats;
+  }> = [];
+  const skipped: Array<{ basePath: string; reason: string }> = [];
+  const failures: Array<
+    { basePath: string; action?: SyncActionType; path?: string; error: string }
+  > = [];
+  const stats = emptyStats();
+
+  for (const service of services) {
+    const serviceRoot = serviceBasePathToLocalPath(localRoot, service.basePath);
+    let localStat: Deno.FileInfo;
+    try {
+      localStat = await Deno.stat(serviceRoot);
+    } catch (error) {
+      if (error instanceof Deno.errors.NotFound) {
+        skipped.push({
+          basePath: service.basePath,
+          reason: "local directory missing",
+        });
+        continue;
+      }
+      throw error;
+    }
+    if (!localStat.isDirectory) {
+      failures.push({
+        basePath: service.basePath,
+        error: "local service path is not a directory",
+      });
+      stats.failed++;
+      continue;
+    }
+
+    try {
+      const [localFiles, remoteFiles] = await Promise.all([
+        listLocalFiles(serviceRoot),
+        listRemoteFiles(host, token, service.basePath, { failFast: false }),
+      ]);
+      const { actions, stats: serviceStats } = await planActions(
+        localFiles,
+        remoteFiles,
+        serviceStateFiles(workspaceState, service.basePath),
+        serviceRoot,
+        localModes,
+        remoteModes,
+      );
+      addStats(stats, serviceStats);
+      servicePlans.push({
+        basePath: service.basePath,
+        localRoot: serviceRoot,
+        localFiles,
+        remoteFiles,
+        actions,
+        stats: serviceStats,
+      });
+    } catch (error) {
+      stats.failed++;
+      failures.push({
+        basePath: service.basePath,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
+  const allActions = servicePlans.flatMap((service) =>
+    service.actions.map((action) => ({ basePath: service.basePath, action }))
+  );
+  const planned = summarizePlan(allActions.map((value) => value.action));
+
+  writeSuccess({
+    preview: true,
+    path: localRoot,
+    workspace: true,
+    modes: {
+      local: localModes.length > 0 ? localModes : null,
+      remote: remoteModes.length > 0 ? remoteModes : null,
+    },
+    planned,
+    skipped,
+    failedServices: failures,
+    analysis: {
+      localFiles: stats.localFiles,
+      remoteFiles: stats.remoteFiles,
+      noChange: stats.noChange,
+      ignored: stats.ignored,
+    },
+    ...(options.verbose && allActions.length > 0
+      ? {
+        actions: allActions.map(({ basePath, action }) => ({
+          service: basePath,
+          type: action.type,
+          path: action.relativePath,
+          reason: action.reason,
+        })),
+      }
+      : {}),
+  });
+
+  if (allActions.length > 0 && !options.yes) {
+    let approved = false;
+    try {
+      approved = confirm("Proceed with sync changes? [y/N]");
+    } catch {
+      writeError({
+        error: "Unable to read interactive confirmation.",
+        suggestion: "Run with -y or --yes to bypass confirmation.",
+      });
+    }
+    if (!approved) {
+      writeSuccess({
+        path: localRoot,
+        workspace: true,
+        planned,
+        skipped,
+        aborted: true,
+      });
+      return;
+    }
+  }
+
+  for (const service of servicePlans) {
+    for (const action of service.actions) {
+      try {
+        await executeAction(
+          action,
+          host,
+          token,
+          service.localRoot,
+          service.basePath,
+          stats,
+        );
+      } catch (error) {
+        stats.failed++;
+        failures.push({
+          basePath: service.basePath,
+          action: action.type,
+          path: action.relativePath,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
+  }
+
+  if (stats.failed > 0) {
+    writeError({
+      error: "Workspace sync completed with errors.",
+      stats,
+      skipped,
+      failures,
+    });
+  }
+
+  const refreshedServices = [];
+  for (const service of servicePlans) {
+    const [localFiles, remoteFiles] = await Promise.all([
+      listLocalFiles(service.localRoot),
+      listRemoteFiles(host, token, service.basePath, { failFast: false }),
+    ]);
+    refreshedServices.push({
+      basePath: service.basePath,
+      localRoot: service.localRoot,
+      localFiles,
+      remoteFiles,
+    });
+  }
+  await writeWorkspaceState(localRoot, configState, refreshedServices);
+
+  writeSuccess({
+    path: localRoot,
+    workspace: true,
+    modes: {
+      local: localModes.length > 0 ? localModes : null,
+      remote: remoteModes.length > 0 ? remoteModes : null,
+    },
+    skipped,
+    stats,
+  });
+}
 
 export async function runSync(
   options: {
@@ -796,11 +1684,17 @@ export async function runSync(
     remote?: string | string[];
     yes?: boolean;
     verbose?: boolean;
+    init?: boolean;
   },
   path: string,
   siteRelativeUrl?: string,
 ): Promise<void> {
   const localRoot = resolve(path);
+  if (options.init) {
+    await runSyncInit(path, siteRelativeUrl);
+    return;
+  }
+
   let localStat: Deno.FileInfo;
   try {
     localStat = await Deno.stat(localRoot);
@@ -818,6 +1712,11 @@ export async function runSync(
       error: `Local path '${path}' is not a directory.`,
       suggestion: "Provide a directory path to sync.",
     });
+  }
+
+  if (!siteRelativeUrl?.trim() && await servicesFileExists(localRoot)) {
+    await runMultiServiceSync(options, localRoot);
+    return;
   }
 
   const localModes = parseModes("local", options.local);
@@ -972,6 +1871,7 @@ export function syncCommand() {
       { collect: true },
     )
     .option("-y, --yes", "Bypass confirmation prompt")
+    .option("--init", "Initialize a multi-service sync workspace")
     .option(
       "-v, --verbose",
       "Show per-file reasons for scheduled uploads/downloads",
@@ -983,6 +1883,7 @@ export function syncCommand() {
           remote?: string | string[];
           yes?: boolean;
           verbose?: boolean;
+          init?: boolean;
         },
         path,
         siteRelativeUrl,
