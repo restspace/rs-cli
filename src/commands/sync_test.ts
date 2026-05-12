@@ -182,8 +182,9 @@ Deno.test("diffConfigServices reports added removed and changed with determinist
 
 Deno.test("service base paths map nested directories and reject unsafe paths", () => {
   assertEquals(serviceBasePathToRelativePath("/api/v1"), "api/v1");
+  assertEquals(serviceBasePathToRelativePath("/"), "$ROOT");
   assert(validateServiceBasePath("/app").ok);
-  assertFalse(validateServiceBasePath("/").ok);
+  assert(validateServiceBasePath("/").ok);
   assertFalse(validateServiceBasePath("").ok);
   assertFalse(validateServiceBasePath("/../app").ok);
   assertFalse(validateServiceBasePath("/.well-known/restspace").ok);
@@ -208,6 +209,7 @@ Deno.test("runSync --init writes services.json and creates store service directo
           return new Response(
             JSON.stringify({
               services: {
+                "/": { source: "config" },
                 "/app": { source: "config" },
                 "/api/v1": { source: "config" },
                 "/plain": { source: "config" },
@@ -225,6 +227,7 @@ Deno.test("runSync --init writes services.json and creates store service directo
         return new Response(
           JSON.stringify({
             services: {
+              "/": { apis: ["store"] },
               "/app": { apis: ["store"] },
               "/api/v1": { apis: ["store-versioned"] },
               "/plain": { apis: ["query"] },
@@ -245,6 +248,7 @@ Deno.test("runSync --init writes services.json and creates store service directo
         await runSync({ init: true }, workspace);
         const raw = await Deno.readTextFile(join(workspace, "services.json"));
         assertEquals(JSON.parse(raw).services["/app"], { source: "config" });
+        assert((await Deno.stat(join(workspace, "$ROOT"))).isDirectory);
         assert((await Deno.stat(join(workspace, "app"))).isDirectory);
         assert((await Deno.stat(join(workspace, "api", "v1"))).isDirectory);
         await assertMissing(join(workspace, "plain"));
@@ -273,8 +277,10 @@ Deno.test("runSync multi-service skips missing service directories", async () =>
   await withTempHome(async () => {
     await withTempDir(async (workspace) => {
       await Deno.mkdir(join(workspace, "app"), { recursive: true });
+      await Deno.mkdir(join(workspace, "$ROOT"), { recursive: true });
       const config = {
         services: {
+          "/": { apis: ["store"] },
           "/app": { apis: ["store"] },
           "/missing": { apis: ["store"] },
         },
@@ -316,6 +322,12 @@ Deno.test("runSync multi-service skips missing service directories", async () =>
         assertEquals(
           calls.filter((call) => call.url.includes("/app/?$list=details"))
             .length,
+          2,
+        );
+        assertEquals(
+          calls.filter((call) =>
+            call.url === "https://tenant.restspace.io/?$list=details"
+          ).length,
           2,
         );
         const finalPayload = JSON.parse(logMessages.at(-1) ?? "{}");

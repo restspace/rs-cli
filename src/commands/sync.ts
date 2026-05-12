@@ -11,6 +11,7 @@ const SERVICES_FILE_NAME = "services.json";
 const RAW_CONFIG_PATH = "/.well-known/restspace/raw";
 const SERVICES_RAW_CONFIG_PATH = "/.well-known/restspace/services/raw";
 const ADMIN_BASE_PATH = "/.well-known/restspace";
+const ROOT_SERVICE_DIRECTORY = "$ROOT";
 const CLOCK_SKEW_WINDOW_MS = 60_000;
 const MANAGE_HEADERS = { "X-Restspace-Request-Mode": "manage" };
 
@@ -280,7 +281,7 @@ export function validateServiceBasePath(basePath: string):
   const normalized = trimmed.replace(/\/+$/, "") || "/";
   const segments = normalized.split("/").slice(1);
   if (normalized === "/") {
-    return { ok: false, reason: "root is not allowed" };
+    return { ok: true, basePath: normalized };
   }
   if (
     segments.some((segment) => !segment || segment === "." || segment === "..")
@@ -310,7 +311,10 @@ function normalizeServiceBasePath(basePath: string): string {
 }
 
 export function serviceBasePathToRelativePath(basePath: string): string {
-  return normalizeServiceBasePath(basePath).replace(/^\/+/, "");
+  const normalized = normalizeServiceBasePath(basePath);
+  return normalized === "/"
+    ? ROOT_SERVICE_DIRECTORY
+    : normalized.replace(/^\/+/, "");
 }
 
 function serviceBasePathToLocalPath(
