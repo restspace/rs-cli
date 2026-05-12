@@ -280,6 +280,13 @@ Deno.test("runSync multi-service skips missing service directories", async () =>
       await Deno.mkdir(join(workspace, "$ROOT"), { recursive: true });
       const config = {
         services: {
+          "/": { name: "Root" },
+          "/app": { name: "App" },
+          "/missing": { name: "Missing" },
+        },
+      };
+      const serviceMetadata = {
+        services: {
           "/": { apis: ["store"] },
           "/app": { apis: ["store"] },
           "/missing": { apis: ["store"] },
@@ -295,6 +302,15 @@ Deno.test("runSync multi-service skips missing service directories", async () =>
         calls.push({ url: request.url, method: request.method });
         if (request.url.endsWith("/.well-known/restspace/raw")) {
           return new Response(JSON.stringify(config), {
+            status: 200,
+            headers: {
+              "content-type": "application/json",
+              "last-modified": "Tue, 12 May 2026 10:00:00 GMT",
+            },
+          });
+        }
+        if (request.url.endsWith("/.well-known/restspace/services/raw")) {
+          return new Response(JSON.stringify(serviceMetadata), {
             status: 200,
             headers: {
               "content-type": "application/json",
@@ -361,6 +377,12 @@ Deno.test("runSync treats nested service directories as sync boundaries", async 
       );
       const config = {
         services: {
+          "/spec": { name: "Spec" },
+          "/spec/data": { name: "Spec Data" },
+        },
+      };
+      const serviceMetadata = {
+        services: {
           "/spec": { apis: ["store"] },
           "/spec/data": { apis: ["store"] },
         },
@@ -376,6 +398,15 @@ Deno.test("runSync treats nested service directories as sync boundaries", async 
         calls.push({ url: request.url, method: request.method });
         if (request.url.endsWith("/.well-known/restspace/raw")) {
           return new Response(JSON.stringify(config), {
+            status: 200,
+            headers: {
+              "content-type": "application/json",
+              "last-modified": "Tue, 12 May 2026 10:00:00 GMT",
+            },
+          });
+        }
+        if (request.url.endsWith("/.well-known/restspace/services/raw")) {
+          return new Response(JSON.stringify(serviceMetadata), {
             status: 200,
             headers: {
               "content-type": "application/json",

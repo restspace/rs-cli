@@ -1553,10 +1553,12 @@ async function runMultiServiceSync(
     configPlan,
   );
   const configState = await buildConfigState(localRoot, remoteConfigMeta);
-  const workspaceConfig = await readJsonFile(
-    join(localRoot, SERVICES_FILE_NAME),
+  const serviceMetadata = await fetchRemoteConfig(
+    host,
+    token,
+    SERVICES_RAW_CONFIG_PATH,
   );
-  const services = extractStoreCapableServices(workspaceConfig);
+  const services = extractStoreCapableServices(serviceMetadata.json);
 
   const servicePlans: Array<{
     basePath: string;
