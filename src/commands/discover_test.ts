@@ -11,6 +11,7 @@ import {
   loadCatalogue,
   loadServicesJsonc,
   parseServicesJsoncSummaries,
+  summarizeCatalogue,
 } from "./discover.ts";
 import type { ApiClient } from "../lib/api-client.ts";
 
@@ -75,6 +76,53 @@ Deno.test("loadAgentDiscoveryJsonc fetches raw.jsonc and preserves comments", as
   } finally {
     fetchStub.restore();
   }
+});
+
+Deno.test("summarizeCatalogue maps service and adapter names to descriptions", () => {
+  const summary = summarizeCatalogue({
+    services: [
+      { name: "Data Service", description: "Read/write generic data." },
+      { name: "File Service" },
+      { description: "Ignored without a name." },
+    ],
+    adapters: [
+      {
+        name: "MongoDbDataAdapter",
+        description: "Store data in MongoDB.",
+      },
+    ],
+  });
+
+  assertEquals(summary, {
+    services: {
+      "Data Service": "Read/write generic data.",
+      "File Service": "",
+    },
+    adapters: {
+      MongoDbDataAdapter: "Store data in MongoDB.",
+    },
+  });
+});
+
+Deno.test("summarizeCatalogue uses only catalogue services and adapters", () => {
+  const summary = summarizeCatalogue({
+    data: { name: "Legacy Data", description: "Ignored top-level entry." },
+    services: {
+      data: { name: "Data Service", description: "Read/write generic data." },
+    },
+    adapters: {
+      mongo: { name: "MongoDbDataAdapter" },
+    },
+  });
+
+  assertEquals(summary, {
+    services: {
+      "Data Service": "Read/write generic data.",
+    },
+    adapters: {
+      MongoDbDataAdapter: "",
+    },
+  });
 });
 
 Deno.test("loadServicesJsonc fetches /services.jsonc and preserves comments", async () => {

@@ -24,6 +24,10 @@ type CatalogueMatch = {
   key: string;
   entry: JsonRecord;
 };
+type CatalogueSummary = {
+  services: Record<string, string>;
+  adapters: Record<string, string>;
+};
 type AgentDiscovery = {
   services?: unknown;
   patterns?: unknown;
@@ -595,6 +599,33 @@ function isRecord(value: unknown): value is JsonRecord {
   return !!value && typeof value === "object" && !Array.isArray(value);
 }
 
+function summarizeCatalogueSection(section: unknown): Record<string, string> {
+  const summary: Record<string, string> = {};
+  const entries = Array.isArray(section)
+    ? section
+    : isRecord(section)
+    ? Object.values(section)
+    : [];
+
+  for (const entry of entries) {
+    if (!isRecord(entry) || typeof entry.name !== "string") {
+      continue;
+    }
+    summary[entry.name] = typeof entry.description === "string"
+      ? entry.description
+      : "";
+  }
+  return summary;
+}
+
+export function summarizeCatalogue(catalogue: unknown): CatalogueSummary {
+  const source = isRecord(catalogue) ? catalogue : {};
+  return {
+    services: summarizeCatalogueSection(source.services),
+    adapters: summarizeCatalogueSection(source.adapters),
+  };
+}
+
 export function findCatalogueEntry(
   catalogue: unknown,
   lookup: string,
@@ -692,7 +723,7 @@ export function discoverCommand() {
         manageHeaders(options.manage),
       );
       if (!name) {
-        writeSuccess({ catalogue });
+        writeRaw(`${JSON.stringify(summarizeCatalogue(catalogue), null, 2)}\n`);
         return;
       }
       const match = findCatalogueEntry(catalogue, name);
