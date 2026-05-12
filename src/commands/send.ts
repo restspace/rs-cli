@@ -172,6 +172,7 @@ export function sendCommand() {
       collect: true,
     })
     .option("--timeout <ms:number>", "Request timeout in milliseconds")
+    .option("--manage", "Set X-Restspace-Request-Mode: manage on the request")
     .action(async (options, method, path) => {
       const config = await loadAuthReadyConfig();
       const host = resolveHost(config.host);
@@ -179,6 +180,9 @@ export function sendCommand() {
       const body = await resolveBody(options);
 
       const headers: Record<string, string> = {};
+      if (options.manage) {
+        headers["X-Restspace-Request-Mode"] = "manage";
+      }
       if (options.header) {
         for (const header of options.header as string[]) {
           const [key, value] = parseHeader(header);

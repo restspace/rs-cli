@@ -11,5 +11,27 @@
       "Bash(rs call:*)",
       "Bash(deno cache:*)"
     ]
+  },
+  "hooks": {
+    "Notification": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "http",
+            "url": "http://127.0.0.1:4312/api/attention/claude",
+            "timeout": 30,
+            "headers": {
+              "x-terminal-canvas-token": "$TERMINAL_CANVAS_ATTENTION_TOKEN",
+              "x-terminal-canvas-session-id": "$TERMINAL_CANVAS_SESSION_ID"
+            },
+            "allowedEnvVars": [
+              "TERMINAL_CANVAS_ATTENTION_TOKEN",
+              "TERMINAL_CANVAS_SESSION_ID"
+            ]
+          }
+        ]
+      }
+    ]
   }
 }

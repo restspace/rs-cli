@@ -101,10 +101,11 @@ async function sendRequest(
   method: string,
   path: string,
   body?: string,
+  headers?: Record<string, string>,
 ): Promise<void> {
   let response: ApiResponse;
   try {
-    response = await client.request(method, path, { body });
+    response = await client.request(method, path, { body, headers });
   } catch (error) {
     writeError({
       error: error instanceof Error ? error.message : String(error),
@@ -137,12 +138,21 @@ async function sendRequest(
   });
 }
 
-export function pipelineCommand(): Command {
-  const command = new Command().description("Pipeline operations.");
+function manageHeaders(manage?: boolean): Record<string, string> | undefined {
+  return manage ? { "X-Restspace-Request-Mode": "manage" } : undefined;
+}
+
+export function pipelineCommand() {
+  const command = new Command()
+    .description("Pipeline operations.")
+    .globalOption(
+      "--manage",
+      "Set X-Restspace-Request-Mode: manage on requests",
+    );
 
   command.command("list [path:string]")
     .description("List stored pipelines.")
-    .action(async (_options, path) => {
+    .action(async (options, path) => {
       if (!path) {
         writeError({
           error: "Missing pipeline store path.",
@@ -153,16 +163,28 @@ export function pipelineCommand(): Command {
       const config = await loadAuthReadyConfig();
       const host = resolveHost(config.host);
       const client = new ApiClient(host, config.auth?.token);
-      await sendRequest(client, "GET", path);
+      await sendRequest(
+        client,
+        "GET",
+        path,
+        undefined,
+        manageHeaders(options.manage),
+      );
     });
 
   command.command("get <path:string>")
     .description("Get a pipeline spec.")
-    .action(async (_options, path) => {
+    .action(async (options, path) => {
       const config = await loadAuthReadyConfig();
       const host = resolveHost(config.host);
       const client = new ApiClient(host, config.auth?.token);
-      await sendRequest(client, "GET", path);
+      await sendRequest(
+        client,
+        "GET",
+        path,
+        undefined,
+        manageHeaders(options.manage),
+      );
     });
 
   command.command("create <path:string>")
@@ -180,7 +202,13 @@ export function pipelineCommand(): Command {
       const config = await loadAuthReadyConfig();
       const host = resolveHost(config.host);
       const client = new ApiClient(host, config.auth?.token);
-      await sendRequest(client, "PUT", path, body);
+      await sendRequest(
+        client,
+        "PUT",
+        path,
+        body,
+        manageHeaders(options.manage),
+      );
     });
 
   command.command("execute <path:string>")
@@ -192,7 +220,13 @@ export function pipelineCommand(): Command {
       const config = await loadAuthReadyConfig();
       const host = resolveHost(config.host);
       const client = new ApiClient(host, config.auth?.token);
-      await sendRequest(client, "POST", path, body);
+      await sendRequest(
+        client,
+        "POST",
+        path,
+        body,
+        manageHeaders(options.manage),
+      );
     });
 
   command.command("explain")

@@ -158,12 +158,21 @@ async function sendRequest(
   });
 }
 
-export function queryCommand(): Command {
-  const command = new Command().description("Query operations.");
+function manageHeaders(manage?: boolean): Record<string, string> | undefined {
+  return manage ? { "X-Restspace-Request-Mode": "manage" } : undefined;
+}
+
+export function queryCommand() {
+  const command = new Command()
+    .description("Query operations.")
+    .globalOption(
+      "--manage",
+      "Set X-Restspace-Request-Mode: manage on requests",
+    );
 
   command.command("list [path:string]")
     .description("List stored queries.")
-    .action(async (_options, path) => {
+    .action(async (options, path) => {
       if (!path) {
         writeError({
           error: "Missing query store path.",
@@ -173,16 +182,28 @@ export function queryCommand(): Command {
       const config = await loadAuthReadyConfig();
       const host = resolveHost(config.host);
       const client = new ApiClient(host, config.auth?.token);
-      await sendRequest(client, "GET", path);
+      await sendRequest(
+        client,
+        "GET",
+        path,
+        undefined,
+        manageHeaders(options.manage),
+      );
     });
 
   command.command("get <path:string>")
     .description("Get a query template.")
-    .action(async (_options, path) => {
+    .action(async (options, path) => {
       const config = await loadAuthReadyConfig();
       const host = resolveHost(config.host);
       const client = new ApiClient(host, config.auth?.token);
-      await sendRequest(client, "GET", path);
+      await sendRequest(
+        client,
+        "GET",
+        path,
+        undefined,
+        manageHeaders(options.manage),
+      );
     });
 
   command.command("create <path:string>")
@@ -202,6 +223,7 @@ export function queryCommand(): Command {
       const client = new ApiClient(host, config.auth?.token);
       await sendRequest(client, "PUT", path, body, {
         "content-type": "text/plain",
+        ...manageHeaders(options.manage),
       });
     });
 
@@ -214,7 +236,13 @@ export function queryCommand(): Command {
       const config = await loadAuthReadyConfig();
       const host = resolveHost(config.host);
       const client = new ApiClient(host, config.auth?.token);
-      await sendRequest(client, "POST", path, body);
+      await sendRequest(
+        client,
+        "POST",
+        path,
+        body,
+        manageHeaders(options.manage),
+      );
     });
 
   command.command("explain")
