@@ -1278,8 +1278,18 @@ async function buildConfigState(
   };
 }
 
-export const SYNC_DESCRIPTION =
-  "Sync a local directory with a remote Restspace directory (previews changes and asks for confirmation unless --yes is provided).";
+export const SYNC_DESCRIPTION = `Sync local files with Restspace store services.
+
+Single-directory mode syncs <path> with [siteRelativeUrl]. If siteRelativeUrl is
+omitted, rs uses the path's .rs-sync file when present.
+
+Multi-directory mode treats <path> as a workspace when it contains services.json.
+Each service base path with a store API maps to a matching local directory
+("/" maps to "$ROOT"), and nested service directories are treated as separate
+sync boundaries. Use --init to create a workspace from the tenant services
+configuration before syncing.
+
+Sync previews changes and asks for confirmation unless --yes is provided.`;
 
 async function ensureInitRoot(
   localRoot: string,
@@ -1946,6 +1956,18 @@ export function syncCommand() {
   return new Command()
     .description(SYNC_DESCRIPTION)
     .arguments("<path:string> [siteRelativeUrl:string]")
+    .example(
+      "Initialize a multi-directory workspace",
+      "rs sync ./workspace --init",
+    )
+    .example(
+      "Sync all store service directories in a workspace",
+      "rs sync ./workspace",
+    )
+    .example(
+      "Sync one directory with one remote path",
+      "rs sync ./public /app",
+    )
     .option(
       "--local <mode:string>",
       "Local mismatch behavior: add|delete (repeatable)",
@@ -1957,7 +1979,7 @@ export function syncCommand() {
       { collect: true },
     )
     .option("-y, --yes", "Bypass confirmation prompt")
-    .option("--init", "Initialize a multi-service sync workspace")
+    .option("--init", "Initialize a multi-directory sync workspace")
     .option(
       "-v, --verbose",
       "Show per-file reasons for scheduled uploads/downloads",

@@ -41,8 +41,14 @@ Notes:
 
 ## Sync Command Notes
 
-- `rs sync <path> [siteRelativeUrl]` analyses changes first and shows a preview
-  summary.
+- `rs sync <path> [siteRelativeUrl]` syncs one local directory with one remote
+  Restspace directory, analyses changes first, and shows a preview summary.
+- `rs sync <workspace> --init` initializes a multi-directory sync workspace from
+  the tenant services configuration, writing `services.json` and creating local
+  directories for store-backed services.
+- `rs sync <workspace>` enters multi-directory mode when the workspace contains
+  `services.json`. Each store service base path maps to a matching local
+  directory, with `/` stored in `$ROOT`.
 - By default, sync asks for approval before applying changes.
 - Use `-y` or `--yes` to bypass the confirmation prompt.
 
